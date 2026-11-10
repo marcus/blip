@@ -87,7 +87,7 @@ FocusScope {
   readonly property bool editorActive:
     messageMenu.visible || emojiPopup.visible || contactMenu.visible || contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused || focusedAudio !== null || focusedReaction !== null || actionFocused
   readonly property bool actionFocused: newMessageButton.activeFocus || compactNewMessageButton.activeFocus || appWindowButton.activeFocus
-    || backButton.activeFocus || conversationActions.activeFocus || attachmentButton.activeFocus || emojiButton.activeFocus || sendButton.activeFocus
+    || windowControls.controlFocused || backButton.activeFocus || conversationActions.activeFocus || attachmentButton.activeFocus || emojiButton.activeFocus || sendButton.activeFocus
   property var focusedAudio: null
   property var focusedReaction: null
   readonly property alias composeEditor: composeField
@@ -2626,8 +2626,30 @@ FocusScope {
   // ---- layout: one pane (popout) or two (window). Both panes always exist —
   // hiding, not unloading, keeps image state, selection, and scroll position.
   property bool splitView: false
+  // Only the standalone window supplies chrome; the bar popout stays unchanged.
+  property var windowChrome: null
   property int sidebarWidth: Math.min(340, Math.max(260, width * 0.30))
   readonly property bool listShowing: splitView || !inThread
+
+  // Keep window actions reachable even while the contact review fills the view.
+  WindowControls {
+    id: windowControls
+    x: Style.space(12)
+    y: Style.space(10)
+    z: 20
+    visible: root.windowChrome !== null && root.splitView
+    windowActive: root.windowChrome ? root.windowChrome.focused : false
+    foreground: root.foreground
+    onCloseRequested: root.windowChrome.closeWindow()
+    onMinimizeRequested: root.windowChrome.windowAction("minimize")
+    onMaximizeRequested: root.windowChrome.windowAction("maximize")
+  }
+  WindowDragArea {
+    anchors.left: parent.left; anchors.right: parent.right
+    height: Style.space(42)
+    visible: contactReview.opened
+    windowChrome: root.windowChrome
+  }
 
   RowLayout {
     anchors.fill: parent
@@ -2654,8 +2676,14 @@ FocusScope {
         RowLayout {
           Layout.fillWidth: true
           Layout.preferredHeight: Style.space(32)
+          Layout.maximumHeight: Style.space(32)
           spacing: Style.space(8)
-          Item { Layout.fillWidth: true }
+          Item { visible: root.windowChrome !== null && root.splitView; Layout.preferredWidth: 72; Layout.preferredHeight: 32 }
+          Item {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            WindowDragArea { anchors.fill: parent; windowChrome: root.windowChrome }
+          }
           // A single-pane popout keeps its compose action beside Open App.
           // The app's compose action lives across the divider in its header.
           ComposerButton {
@@ -3377,6 +3405,7 @@ FocusScope {
         Item {
           Layout.fillWidth: true
           Layout.preferredHeight: root.inThread ? (headerMeta.visible ? Style.space(98) : Style.space(82)) : Style.space(50)
+          WindowDragArea { anchors.fill: parent; windowChrome: root.windowChrome }
           ComposerButton {
             id: newMessageButton
             visible: root.splitView && root.online && !root.newMode
@@ -5050,6 +5079,7 @@ FocusScope {
     id: contactReview
     objectName: "blipContactReview"
     anchors.fill: parent
+    anchors.topMargin: root.windowChrome !== null && root.splitView ? Style.space(42) : 0
     threads: root.threads
     foreground: root.foreground
     accent: root.accent

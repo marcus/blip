@@ -169,6 +169,14 @@ FloatingWindow {
   onOwnToplevelChanged: {
     if (ownToplevel && restorationTitle !== "") Qt.callLater(function() { restorationTitle = "" })
   }
+  function closeWindow() {
+    if (hostWidget && hostWidget.hideWindow) hostWidget.hideWindow()
+    else visible = false
+  }
+  function windowAction(action) {
+    var address = ourAddress()
+    if (address) Quickshell.execDetached(["bun", Qt.resolvedUrl("window-controls.ts").toString().replace(/^file:\/\//, ""), action, address])
+  }
   function requestShow() {
     explicitShow = true
     if (restoreReady) visible = true
@@ -258,6 +266,7 @@ FloatingWindow {
         anchors.margins: 0
         hostWidget: win.hostWidget
         splitView: true
+        windowChrome: win
         surfaceOpen: win.visible
         readActive: win.focused
         foreground: Commons.Color.foreground

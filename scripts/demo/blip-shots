@@ -99,6 +99,14 @@ done
 [[ $ready -gt 0 ]] || { echo "demo shell never came up; see $SANDBOX/qs.log" >&2; tail -20 "$SANDBOX/qs.log" >&2; exit 1; }
 echo "· $ready conversations loaded"
 
+# A real standalone window for chrome/lifecycle QA. Never use the panel's fixed
+# screenshot crop here: it could include unrelated windows on the desktop.
+if [[ ${BLIP_DEMO_FLOATING:-0} == 1 ]]; then
+  echo "· standalone demo ready (pid $DEMO_PID); inspect via chrome IPC"
+  [[ $KEEP == 1 ]] || { echo "use --keep for standalone QA" >&2; exit 64; }
+  exit 0
+fi
+
 # The demo surface is a layer-shell panel at a fixed origin and size (see
 # DemoShell.qml), so the crop is known without asking the compositor anything.
 WIDE="220,140 1040x720"
@@ -124,6 +132,13 @@ ipc open "$CONV" >/dev/null;              shoot panel-conversation 3.0
 mode wide; GEOM="$WIDE"
 ipc open "$CONV" >/dev/null;              shoot app 3.0
 ipc share https://oatlug.org >/dev/null;  shoot share-sheet 2.5
+
+if [[ ${BLIP_DEMO_CHROME_QA:-0} == 1 ]]; then
+  ipc dismiss >/dev/null
+  ipc size 720 480 >/dev/null
+  GEOM="220,140 720x480"
+  shoot app-minimum 2.0
+fi
 
 if [[ $KEEP == 1 ]]; then
   echo "· window left up (pid $DEMO_PID) — kill it when you are done"

@@ -1013,3 +1013,36 @@ or first name when no nickname is set (for example, `Ex.vcf`).
 **Save vCard…** lets you choose Downloads or another folder. It saves a named
 `.vcf` you can attach, drag, or keep; existing files are preserved by adding a
 number to the new filename. Neither action changes the contact on the Mac.
+
+### Integrated window controls
+
+The standalone window puts close, minimize and maximize/restore controls in
+its sidebar toolbar. Drag empty toolbar space to move the window; double-click
+it to maximize or restore. Close hides the app window while leaving the bar
+widget running. The bar popout has no window controls.
+
+For Omarchy floating workspaces, suppress the duplicate compositor titlebar.
+Add this to your personal Hyprland Lua configuration (after Omarchy defaults):
+
+```lua
+if hl.plugin.hyprbars then
+  hl.window_rule({
+    name = "blip-integrated-chrome",
+    match = { class = "^org.quickshell$", title = "^(Messages|Blip( [(][0-9]+[)])?)$" },
+    ["hyprbars:no_bar"] = true,
+  })
+end
+```
+
+Reload Hyprland and check `hyprctl configerrors`. The plugin guard allows the
+configuration to load on systems without Omarchy titlebars. Minimize uses
+`~/.local/bin/window-minimize` when present, falling back to Omarchy's dock
+helper. The custom helper receives `WINDOW_TITLEBAR_HEIGHT=0` so an animated
+capture can exclude the removed external titlebar.
+
+Chrome QA: `bun test` and `python3 scripts/test-window-controls-ui.py`.
+`BLIP_DEMO_FLOATING=1 scripts/demo/blip-shots --keep` launches a real standalone
+window against the isolated fake bridge; its `chrome` IPC target exposes
+`state`, `action minimize|maximize`, and `close` for lifecycle checks. Use the
+demo's private runtime directory when calling its IPC. Regular demo screenshots
+still use an overlay, so they cannot capture unrelated windows behind the app.

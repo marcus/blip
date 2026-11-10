@@ -18,6 +18,7 @@ import qs.Commons as Commons
 // HOME, or the collector would read a real chat.db.
 ShellRoot {
   id: shell
+  readonly property bool floatingDemo: Quickshell.env("BLIP_DEMO_FLOATING") === "1"
 
   QtObject {
     id: host
@@ -80,6 +81,30 @@ ShellRoot {
     }
   }
 
+  Loader {
+    id: appLoader
+    active: shell.floatingDemo
+    source: Qt.resolvedUrl("BlipWindow.qml")
+    onLoaded: { item.hostWidget = host; item.requestShow() }
+  }
+  IpcHandler {
+    target: "chrome"
+    function state(): string {
+      var w = appLoader.item
+      return JSON.stringify({visible:w ? w.visible : false,address:w ? w.ourAddress() : "",maximized:w ? w.maximized : false})
+    }
+    function action(action: string): string { appLoader.item.windowAction(action); return "requested" }
+    function close(): string { appLoader.item.closeWindow(); return "closed" }
+  }
+
+  QtObject {
+    id: previewChrome
+    property bool focused: true
+    function closeWindow() { }
+    function windowAction(action) { }
+    function startSystemMove() { }
+  }
+
   // A layer-shell panel, not a FloatingWindow: Hyprland TILES a floating
   // window to whatever the layout wants (1253x1375 here), and every shot came
   // out half empty. A layer surface is exactly the size asked for, at the
@@ -104,7 +129,7 @@ ShellRoot {
     property int demoHeight: 720
     implicitWidth: narrow ? 560 : demoWidth
     implicitHeight: demoHeight
-    visible: true
+    visible: !shell.floatingDemo
 
     Rectangle {
       anchors.fill: parent
@@ -120,6 +145,7 @@ ShellRoot {
       audioMuted: true          // never make QA playback audible
       readActive: false          // a screenshot must never move a read mark
       splitView: !win.narrow
+      windowChrome: win.narrow ? null : previewChrome
       foreground: Commons.Color.foreground
       urgent: Commons.Color.urgent
       themeFont: Style.font.family
