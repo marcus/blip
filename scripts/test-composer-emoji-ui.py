@@ -95,6 +95,7 @@ Item {
       var grid = findChild(emojiPicker, "reactionEmojiGrid")
       search.text = "rocket"
       tryCompare(grid, "count", 1)
+      grabImage(root).save("/tmp/blip-composer-emoji.png")
       search.forceActiveFocus()
       keyClick(Qt.Key_Return)
       tryCompare(emojiPopup, "visible", false)
@@ -142,7 +143,7 @@ qml = qml.replace('@OPEN@', block('function openEmojiPicker(')).replace('@INSERT
 qml = qml.replace('@COMPOSER@', composer).replace('@POPUP@', popup)
 runner = os.environ.get('QMLTESTRUNNER') or shutil.which('qmltestrunner') or '/usr/lib/qt6/bin/qmltestrunner'
 with tempfile.TemporaryDirectory(prefix='blip-composer-emoji-') as folder:
-    for name in ['ComposerInput.qml', 'ReactionPicker.qml', 'TapbackActions.mjs']:
+    for name in ['ComposerInput.qml', 'ComposerEmojiPicker.qml', 'EmojiPicker.mjs']:
         shutil.copy2(repo / name, Path(folder) / name)
     editor = (repo / 'ComposerInput.qml').read_text().replace('import Quickshell.Io\n', '')
     start = editor.index('  Process {')

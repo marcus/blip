@@ -522,18 +522,19 @@ describe("QML safety invariants", () => {
     expect(parseTouchpadScrollGain("scroll_gain=0.25\ntouchpad_scroll_gain=0.5")).toBe(0.5);
   });
 
-  test("inline voice playback pauses and scopes delayed play intent to its conversation", () => {
+  test("inline playback scopes explicit play intent to the conversation", () => {
     expect(panel).toContain("AudioMessage {");
     expect(panel).toContain('root.enqueueFetch(att, "audio-play", false)');
     expect(panel).toContain("root.audioPlaying = !root.audioPlaying");
     expect(panel).toContain("String(root.active.chat) === root.pendingAudioChat");
-    expect(panel).toContain("root.settleAudioFetch(id, d.ok === true, d.error)");
+    expect(panel).toContain('root.settleAudioFetch(id, d.ok === true, d.error || "")');
     expect(panel).toContain("resetToken: root.audioResetToken");
-    expect(panel).toContain("metadata.playable === true");
-    expect(panel).toContain("focusedAudio !== null || focusedReaction !== null || actionFocused");
-    expect(panel).toContain("if (root.playingAudio === chipRow.attId) root.stopAudio()");
     expect(panel).not.toContain("exec mpv");
-    // Closing, navigating and destruction stop playback and cancel pending fetch intent.
+    // The mpv fallback plays the SENDER's file, so its demuxer is named, never
+    // guessed (a guessed one opens playlists and smuggled streams), and the path
+    // follows "--" so a name cannot become an option.
+    expect(panel).toContain('externalAudio.command = ["mpv", "--no-video", "--demuxer=lavf", "--demuxer-lavf-format=" + format, "--", path]');
+    expect(panel).toContain('root.settleAudioFetch(root.fetchingId, false, "fetch process ended")');
     expect(panel).toContain("if (!surfaceOpen) root.stopAudio()");
     expect(panel).toContain("root.stopAudio() // another conversation");
     expect(panel).toContain("Component.onDestruction: root.stopAudio()");
@@ -1300,5 +1301,26 @@ describe("the bar glyph survives an Omarchy whose OpticalGlyph has no paintedSiz
 
   test("the one file that assigns paintedSize scales to the stock bar icon size", () => {
     expect(optical).toMatch(/^\s*paintedSize\s*:\s*Style\.bar\.iconSize\s*$/m);
+  });
+});
+
+describe("a signed-out Mac is said before a send fails (reads work, sends cannot)", () => {
+  test("the widget takes macSession only from the three known values, and status shows signed-out", () => {
+    expect(widget).toContain('property string macSession: "unknown"');
+    expect(widget).toContain('d.macSession === "ok" || d.macSession === "signed-out" || d.macSession === "unknown"');
+    expect(widget).toContain('(root.macSession === "signed-out" ? " mac_session=signed-out" : "")');
+  });
+
+  test("the view shows the notice only when the Mac is reachable AND signed out", () => {
+    expect(panel).toContain('readonly property bool macSignedOut: online && hostWidget ? hostWidget.macSession === "signed-out" : false');
+    // Use the fork's overlay without adding rows to the transcript/composer.
+    expect(panel).toContain('{ kind: "mac-session", text: root.macSignedOut ? root.macSignedOutText : "" }');
+    expect(readFileSync(new URL("./NoticeOverlay.qml", import.meta.url), "utf8")).toContain("Text.PlainText");
+  });
+
+  test("an unreachable Mac says that instead, never both", () => {
+    // macSignedOut starts with `online &&`; the offline block is `visible: !root.online`.
+    expect(panel).toContain("visible: !root.online\n");
+    expect(panel).toMatch(/macSignedOut: online &&/);
   });
 });

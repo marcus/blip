@@ -64,7 +64,10 @@ what it is handed. Keep it that way.
   `push_read=thread` is enabled (DMs and groups, through Messages, never SQL writes).
   Complete read-state snapshots reconcile the Mac independently of the preview
   window; local marks apply to local-only reads. The self-thread never counts.
-  Tapback rows never count toward the badge, but an incoming reaction DOES
+  The exception to "both sides": under `push_read=thread` the Mac's CONFIRMED state
+  replaces the historical local marks for DMs and groups, so Apple-side alone decides
+  (a pending intent still overrides it); see "Read sync is an acknowledged, durable
+  action queue" below. Tapback rows never count toward the badge, but an incoming reaction DOES
   participate in the read-state snapshot: Messages can mark a reaction unread
   without changing the prior text row.
   chat.db carries GHOST is_read=0 rows years old — never trust is_read alone.
@@ -115,6 +118,14 @@ what it is handed. Keep it that way.
   bubble until a real from-me row with the same text lands, resolving one
   send per row. The read watermark (`--seen`) skips pending bubbles: their ts
   is THIS machine's clock. A failed send retains its bubble with a failure reason in memory. Never go back to "wait 1.5 s, then reload".
+- **A Mac that is signed out READS fine and cannot SEND.** Reads are sqlite over ssh and need no login; a send
+  needs Messages, and Launch Services starts an app only inside a GUI session, so at the login window every send
+  dies with -10810 (`friendlySendError` says it in plain words). `imsg session` is the read-only probe
+  (`launchctl print gui/<uid>`: rc 0 logged in, rc 112 not); `checkMacSession()` asks over the channel at most every
+  20 s and caches `{state, at}` in `mac-session.json`. Only a definite `gui:false` is "signed-out". Everything else,
+  an older bridge, a timeout, junk, is "unknown" and shows NOTHING, and an unreachable Mac shows the offline
+  message instead (`macSignedOut` is `online && ...`). Never block a send on it: the answer can be 20 s stale, and a
+  Mac that was just logged back in must send at once.
 - **A peeked thread is not read.** In the window, the sidebar cursor resting on
   a row shows that thread (`peeking`); focus stays in the list and neither
   read path fires — `markRead()` in BlipView (the only caller of the host's
@@ -244,6 +255,13 @@ what it is handed. Keep it that way.
   payloads. No probe, no trap. The shim no longer `exec`s ssh (it needs the
   exit code to translate); stdio is inherited either way, so attachment
   streaming and `--file-stdin` are untouched — covered by a stub-ssh test.
+  But a remote tool's OWN 69 is not transport: imsg-react uses EX_UNAVAILABLE
+  for Mac-local failures it says on stderr (screen locked, Messages started
+  with no window). `tapbackFailure` calls 69 offline only when the shim's own
+  marker ("unreachable — the iMessage bridge is offline") is on stderr or the
+  tool never ran; the marker check also keeps the shim's `$host` out of the
+  status line. (2026-11-09: a locked gateway said "tapback: Mac unreachable"
+  while sends through the same bridge worked.)
 - **`bridge.conf` is data, never `source`d.** The shim parses four keys and
   validates them; keep it that way (audit #7). `blip-bridged` applies the
   same allowlist before it interpolates `python`/`remote_bin` into a remote
@@ -387,8 +405,16 @@ what it is handed. Keep it that way.
   The pid comes from `messages_pid()` (pgrep), never LaunchServices: over ssh on
   27.2 `NSRunningApplication` and `NSWorkspace` cannot see GUI apps, and JXA
   returns every `count` as a STRING (compare `Number(count)`, never `=== 0`).
-  OPEN on 27.2: Messages renders only ~15 sidebar rows and `open imessage:` did
-  not bring a far-down chat's row into view, so nothing is `AXSelected` for it.
+  Messages builds only the ~15 sidebar rows near the viewport, and `open
+  imessage:` selects a far-down chat WITHOUT scrolling its row into view (27.0.1
+  and 27.2; #150 was only ever tested on a chat already on screen). With no
+  built row selected, the helper pages the `Conversations` group from the top
+  (`AXScrollDownByPage`, its own action) until the selected row exists, acts on
+  it, and returns the list to the top. Never search or match by name instead.
+  Messages allows NINE pins: a tenth puts up an alert sheet while the sidebar
+  action still returns success. After a pin that did not land, `pin_refusal()`
+  reads that sheet and reports its words; it presses OK only on a ONE-button
+  sheet about pinning, and any other alert is read out and left open.
 - **`chat:null` exists.** Use `chatKey()`; never `String(m.chat)`. A row with
   neither chat nor handle is a leftover of a deleted conversation (iCloud keeps
   the row, the chat and the join are gone); `fetchMessages` drops it
@@ -515,6 +541,34 @@ what it is handed. Keep it that way.
   handle that misses the exact last-ten key falls back to a linear scan of
   every contact. Profile on the Mac with `cProfile` + `runpy` before changing
   anything (see the war-room note on wheel scrolling for the same lesson).
+  **Except where it WAS work, and that was found only by measuring (2026-11-10).** On a 530 MB chat.db
+  (282,650 messages) every poll paid 0.6 s for `read-state`, a window function over every inbound message
+  ever received, and every deep poll (window or panel open: all of them) paid ~1 s for `chats`, ~300
+  per-conversation lookups ordered by an expression, so a shallow collector run took 0.77 s and a deep one
+  2.1 s. The fix is the INDEXES Apple ships, not caching: `message_idx_is_read` finds the 24 unread rows of
+  144,621 in 1 ms, and `chat_message_join (chat_id, message_date, message_id)` walks a chat newest-first and
+  stops at the first row that qualifies. `read_state()` is the indexed answer; `read_state_scan()` is the old
+  whole-table one, kept as the fallback AND as the oracle `test_read_sync.py` fuzzes it against. Any change to
+  what counts as unread is made in the scan's contract first, then proven equal on a real database
+  (`read_state(con) == sorted(read_state_scan(con))`). Two traps found on the way: SQLite scans the table for
+  `is_read IS NOT 1` and for any OR of `is_read` tests (55 ms) where each branch UNIONed is an index search
+  (0.8 ms), and `ORDER BY <expression>` defeats an index that `ORDER BY <column>` uses.
+  **Same lesson, third place (2026-11-10): the reaction scan in `enrich()`.** A conversation load read every
+  reaction in chat.db (28,413 of 282,650 rows, a full scan, 93 ms of a 100 ms load once the cluster map and contact index
+  are cached on the serve channel). It now reads from the window's oldest message minus 90 days (`TAPBACK_SKEW_NS`),
+  2 ms through Apple's `message_idx_date`; `skew_ns=None` is the old query, the fallback and the test oracle
+  (`test_tapback_window.py`). The margin is real data, not caution: 3 of 28,305 reactions are stamped BEFORE their
+  target, the worst by 0.83 days, so "reactions come later" is false and a bound without margin drops real ones.
+  Two traps: an `ORDER BY` in the SQL makes the planner prefer the full scan again (sort in Python, and let the plan
+  test guard it), and the date index returns date order, which reorders the reactions on a message unless the rows are
+  sorted by ROWID as the old scan returned them. Do not "optimise" this to probe `associated_message_guid` by guid
+  shape: `_strip_assoc` is deliberately lenient and a macOS update that changes the shape would lose reactions silently.
+  **What is left, measured through the live channel on the 530 MB gateway (2026-11-10):** `chats 400` 421 ms (an exact
+  `COUNT` per chat over 3,358 chats; the `messages` field is part of the vendored claude-on-mac JSON and no Blip code reads
+  it, but leave it alone unless a client needs the speed), `groups` 94 ms and 602 KB, `recent 500` 48 ms, `read-state`
+  40 ms, `session` 16 ms; a warm shallow collector run 0.17 s, a deep one 0.8 to 1.0 s, `thread.ts` 0.14 s end to end.
+  Do not chase `chats`: with `watch=true` the poll timer is 60 s and a deep run happens once per push while a surface is
+  open, not once a second.
 
 - **The persistent channel is an ACCELERATOR; the one-shot path is the
   contract.** `blip-bridged` (Linux, started by the LEADER BarWidget) holds
@@ -584,7 +638,7 @@ what it is handed. Keep it that way.
 ## Working on it
 
 ```
-bun test                                   # 620+ tests, ~1.5 s
+bun test                                   # 860+ tests, ~30 s (read-sync.test.ts is 25 s of it: 16 sequences x 6 collector spawns)
 bun collector.ts --deep | jq .unread       # live against the Mac
 bun thread.ts <chat-id> 40 | jq .bubbles   # one conversation
 scripts/deploy-local   # tests, backup, fast-forward the installed checkout to HEAD, restart, status
@@ -595,6 +649,16 @@ scripts/deploy-local   # tests, backup, fast-forward the installed checkout to H
 # Back up to ~/.local/state/omarchy/plugin-backups/ instead, and after a deploy verify a field
 # the new code emits (e.g. `status` → scroll_gain=), not just "healthy=true".
 # deploy-local ALWAYS restarts: a hot-reload leaves IPC on a zombie.
+omarchy-restart-shell                      # ALWAYS restart (hot-reload leaves IPC on a zombie)
+# The plugin files are only HALF of a deploy. The Linux shims and the channel daemon live in ~/bin and are
+# installed by scripts/blip-setup, so a plugin-only copy leaves them at whatever was last set up. On 2026-11-12
+# gus's were from 12 Oct and vic's from 4 Oct (no IdentityAgent=none, and on vic no argument quoting). After a
+# change under bridge/linux/, on EVERY host: install -m 0755 bridge/linux/blip-shim ~/bin/{imsg,imsg-send,imsg-read,
+# imsg-react,contacts,contact-save} and bridge/linux/blip-bridged ~/bin/, then restart the shell once. A shell
+# restart can ORPHAN the old blip-bridged (parent systemd, same socket, old code); find it with
+# `ps -eo pid,ppid,args | awk '$2=="python3" && $3 ~ /blip-bridged$/'` (its name is python3, so pgrep -x finds
+# nothing) and SIGTERM that pid; the widget starts the new one within ~10 s (its parent must be quickshell).
+# Verify with sha256sum against `git show origin/main:bridge/linux/<file>`, not with "healthy=true".
 # MANDATORY after every deploy — a QML syntax error kills BOTH surfaces silently (2.1.4 shipped one):
 qs log /run/user/1000/quickshell/by-id/$(basename $(readlink /run/user/1000/quickshell/by-pid/$(pgrep -x quickshell)))/log.qslog -t 400 | grep -iE 'nixfred.blip.*(error|warn|unavailable|token)'
 qs -p /usr/share/omarchy/shell ipc call nixfred.blip open   # and LOOK at it (grim)
@@ -713,3 +777,5 @@ Read-sync UI regression: `python3 scripts/test-read-ui.py` executes the shipping
 QML badge bindings and read/unread functions with synthetic data under QtTest.
 `threadsJson` must remain bound to the CURRENT threads, including optimistic
 edits; a poll-only cache allowed a 3-unread badge alongside only 2 unread rows.
+
+Sticker Save also accepts the `-png-` transform: HEIC is a bounded PNG conversion, and HEICS is a single-frame still, not the original sequence.

@@ -161,6 +161,18 @@ class Resolve(unittest.TestCase):
         self.assertIn("not a message bubble", self.refused(row))
         self.assertIn("no message", self.refused("NOPE"))
 
+    def test_a_later_bubble_that_reads_like_the_target_reacted_to_is_counted_a_neighbour_is_not(self):
+        # In the transcript a reacted "ok" reads "ok, Ann loved this", so a later bubble with
+        # exactly that text from the same side in the same minute is indistinguishable from it
+        # and takes an ordinal. A bubble that merely STARTS with "ok, " ("ok, see you then")
+        # is another message and must not: counting it pointed the press at the wrong bubble.
+        add(self.con, 1, "T", "ok", True, T0)
+        add(self.con, 1, "NEIGHBOUR", "ok, see you then", True, T0 + 1_000_000_000)
+        add(self.con, 1, "NEWEST", "bye", False, T0 + 2 * MINUTE)
+        self.assertEqual(self.resolve("T")["ordinal"], 0)
+        add(self.con, 1, "LOOKALIKE", "ok, Ann loved this", True, T0 + 2_000_000_000)
+        self.assertEqual(self.resolve("T")["ordinal"], 1)
+
     def test_identical_bubbles_below_are_counted(self):
         # Three "ok" from me in one minute, one in the next, one from them.
         for i, g in enumerate(["O1", "O2", "O3"]):
@@ -172,6 +184,17 @@ class Resolve(unittest.TestCase):
         t = self.resolve("O1")
         self.assertEqual((t["text"], t["from_me"], t["chat"], t["self_thread"]), ("ok", True, FRIEND, False))
         self.assertEqual(t["newest"], {"text": "bye", "from_me": False, "hhmm": react.hhmm(T0 + 2 * MINUTE)})
+
+    def test_reaction_annotation_lookalike_is_counted(self):
+        add(self.con, 1, "LOOKALIKE", "see you, Ann loved this", True, T0 + 1)
+        add(self.con, 1, "TARGET", "see you", True, T0)
+        target = self.resolve("TARGET")
+        self.assertEqual(target["ordinal"], 1)
+
+    def test_target_which_is_itself_a_reaction_annotation_refuses(self):
+        add(self.con, 1, "TARGET", "ok, Ann loved this", True, T0)
+        with self.assertRaises(react.Stop):
+            self.resolve("TARGET")
 
     def test_a_later_day_twin_at_the_same_hhmm_is_counted(self):
         # The transcript labels bubbles with HH:MM only, so yesterday's "ok" at
@@ -319,13 +342,11 @@ class React(unittest.TestCase):
     # macOS 27: a bubble offers Tapback Details… and none of the six.
     MACOS27 = {"ok": False, "error": "not-offered", "offered": ["press", "Tapback Details…", "Reply…", "Copy"]}
 
-    def test_macos27_sign_opens_the_picker_from_the_target_bubble(self):
-        result, messages = self.run_react([self.MACOS27, OK, {"ok": True, "lands": 2000}])
-        self.assertEqual((result["result"], result["type"]), ("added", 2000))
-        self.assertEqual(messages.performs[-1]["action"], "Tapback Details…")
-        self.assertEqual(len(messages.pickers), 1)
-        self.assertEqual((messages.pickers[0]["text"], messages.pickers[0]["action"]), ("see you", "Heart"))
-        self.assertEqual(self.ui.restored, ["Previous app"])
+    def test_below27_does_not_open_unproven_picker(self):
+        with patch.object(react, "macos_major", return_value=26):
+            result, messages = self.run_react([self.MACOS27])
+        self.assertEqual(result.exit_code, react.EX_NOT_OFFERED)
+        self.assertEqual(messages.pickers, [])
 
     def test_macos27_an_older_message_takes_a_tapback(self):
         add(self.con, 1, "N", "later", True, T0 + MINUTE)
@@ -333,11 +354,6 @@ class React(unittest.TestCase):
             result, messages = self.run_react([OK, {"ok": True, "lands": 2000}])
         self.assertEqual(result["result"], "added")
         self.assertEqual((len(messages.performs), len(messages.pickers)), (1, 1))
-
-    def test_macos27_a_picker_on_another_message_presses_nothing(self):
-        stop, messages = self.run_react([self.MACOS27, OK, {"ok": False, "error": "picker-elsewhere"}])
-        self.assertEqual((stop.exit_code, stop.result["code"]), (react.EX_TEMPFAIL, "picker-elsewhere"))
-        self.assertEqual(len(messages.pickers), 1)
 
     def test_macos27_the_picker_opens_only_after_the_bubble_settles(self):
         with patch.object(react, "macos_major", return_value=27):
@@ -534,6 +550,55 @@ class Consent(unittest.TestCase):
         def never():
             raise AssertionError("probe must not run when TCC.db is there")
         self.assertEqual(react.system_events_consent(self.tcc([self.grant(2)]), probe=never), "")
+
+    def test_a_probe_that_never_answers_refuses_quickly(self):
+        # macOS 27.2 over ssh: AEDeterminePermissionToAutomateTarget addressed by
+        # bundle id never returned, and the tapback sat in the UI lock for minutes.
+        import time
+        started = time.monotonic()
+        stuck = lambda: react._bounded(lambda: time.sleep(30), 0.2)
+        self.assertIn("cannot confirm", react.system_events_consent("/nonexistent/TCC.db", probe=stuck))
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_bounded_returns_the_answer_and_none_for_errors(self):
+        self.assertEqual(react._bounded(lambda: react.AE_GRANTED, 5), react.AE_GRANTED)
+        self.assertEqual(react._bounded(lambda: react.AE_DENIED, 5), react.AE_DENIED)
+        def broken():
+            raise OSError("no CoreServices")
+        self.assertIsNone(react._bounded(broken, 5))
+
+    def test_system_events_is_addressed_by_pid_not_bundle_id(self):
+        # By bundle id needs LaunchServices, which ssh sessions on 27.2 cannot use.
+        source = Path(react.__file__).read_text()
+        body = source[source.index("def ae_permission"):source.index("def system_events_consent")]
+        self.assertIn('four("kpid")', body)
+        self.assertNotIn('four("bund")', body)
+        self.assertIn("_ask_until_ready(lambda: pid_of(process), ask, seconds)", body)
+
+    def test_a_freshly_launched_system_events_is_asked_again(self):
+        # After a reboot: no pid yet, then a pid that answers -600 until it has checked in.
+        pids = iter([None, None, 4242, 4242, 4242])
+        answers = iter([react.AE_NOT_RUNNING, react.AE_NOT_RUNNING, react.AE_GRANTED])
+        asked = []
+        def ask(pid):
+            asked.append(pid)
+            return next(answers)
+        status = react._ask_until_ready(lambda: next(pids), ask, 5, sleep=lambda _: None)
+        self.assertEqual(status, react.AE_GRANTED)
+        self.assertEqual(asked, [4242, 4242, 4242])
+
+    def test_never_running_is_not_running_and_a_hang_stops_at_once(self):
+        never = react._ask_until_ready(lambda: None, lambda pid: react.AE_GRANTED, 5, sleep=lambda _: None)
+        self.assertEqual(never, react.AE_NOT_RUNNING)
+        import time
+        calls = []
+        def hang(pid):
+            calls.append(pid)
+            time.sleep(30)
+        started = time.monotonic()
+        self.assertIsNone(react._ask_until_ready(lambda: 7, hang, 0.2, sleep=lambda _: None))
+        self.assertEqual(calls, [7])
+        self.assertLess(time.monotonic() - started, 5)
 
 
 class Paging(unittest.TestCase):
@@ -853,33 +918,24 @@ class NativeEmojiPickerTests(unittest.TestCase):
     def run_picker(self, ax, q):
         return react.native_emoji_picker(q, ax=ax, pause=lambda _: None)
 
+    def test_native_classics_validate_context_and_unique_button(self):
+        for change in ("valid", "label", "prefix", "duplicate", "focus", "origin"):
+            ax, q, cell, picker, labels, *_ = self.scene(recent=True)
+            q.pop("emoji"); q["action"] = "Heart"
+            cell["AXDescription"] = "Heart"
+            if change == "label": labels[0]["AXDescription"] = "Message, other"
+            if change == "prefix": labels[0]["AXDescription"] = "Message, " + q["text"] + ", see you"
+            if change == "duplicate": picker["AXChildren"].append(dict(cell))
+            if change == "focus": ax.front = False
+            if change == "origin": ax.origin_matches = False
+            self.assertEqual(self.run_picker(ax, q)["ok"], change == "valid")
+            self.assertEqual(ax.pressed, [cell] if change == "valid" else [])
+
     def test_recent_identity_with_matching_duplicate_target_labels(self):
         ax, q, cell, *_ = self.scene(recent=True)
         self.assertEqual(self.run_picker(ax, q), {"ok": True})
         self.assertEqual(ax.pressed, [cell])
 
-
-    def test_existing_picker_is_not_toggled_closed(self):
-        ax, q, cell, *_ = self.scene(recent=True)
-        def must_not_open():
-            raise AssertionError("menu would toggle the existing picker")
-        self.assertEqual(react.native_emoji_picker(q, ax=ax, pause=lambda _: None,
-                                                   open_picker=must_not_open), {"ok": True})
-        self.assertEqual(ax.pressed, [cell])
-
-    def test_absent_picker_is_opened_once_then_validated(self):
-        ax, q, cell, picker, *_ = self.scene(recent=True)
-        container = ax.app["AXChildren"][0]
-        container["AXChildren"].remove(picker)
-        opens = []
-        def open_picker():
-            opens.append(True)
-            container["AXChildren"].insert(0, picker)
-            return ""
-        self.assertEqual(react.native_emoji_picker(q, ax=ax, pause=lambda _: None,
-                                                   open_picker=open_picker), {"ok": True})
-        self.assertEqual(opens, [True])
-        self.assertEqual(ax.pressed, [cell])
 
     def test_search_native_popover_then_press_exact_result(self):
         ax, q, cell, picker, labels, more, popover = self.scene()
@@ -973,6 +1029,7 @@ class NativeGlyphClickTests(unittest.TestCase):
         ax = react.NativeAX.__new__(react.NativeAX)
         ax.C, ax.Point, ax.app, ax.system = C, Point, 1, 2
         ax.check = lambda: None
+        ax.preflight_post = lambda: True
         ax.own = lambda value: value
         ax.frame = lambda _: (10, 20, 40, 40)
         ax.children = lambda _: [99]
@@ -1027,6 +1084,28 @@ class NativeGlyphClickTests(unittest.TestCase):
         self.assertEqual(ax.click_glyph(98, lambda: True)["error"], "perform-failed")
         self.assertEqual(posted, [1, 2])  # always release; never a second down
 
+
+
+class EarlyGateTests(unittest.TestCase):
+    def test_older_os_refuses_before_ui(self):
+        from unittest.mock import Mock
+        ui = Mock()
+        with patch.object(react, "my_rows", return_value=[]), patch.object(react.platform, "mac_ver", return_value=("27.1", (), "")):
+            with self.assertRaises(react.Stop) as err:
+                react.react(None, {"guids":["G"]}, 0, False, [], ui)
+        self.assertIn("27.2", str(err.exception))
+        self.assertEqual(ui.mock_calls, [])
+
+    def test_post_permission_refuses_before_ui_or_picker(self):
+        from unittest.mock import Mock
+        ui, ax = Mock(), Mock()
+        ax.preflight_post.return_value = False
+        with patch.object(react, "my_rows", return_value=[]), patch.object(react.platform, "mac_ver", return_value=("27.2", (), "")), patch.object(react, "NativeAX", return_value=ax):
+            with self.assertRaises(react.Stop) as err:
+                react.react(None, {"guids":["G"]}, 0, False, [], ui, emoji="🪿")
+        self.assertIn("nothing was sent", str(err.exception))
+        self.assertEqual(ui.mock_calls, [])
+        ax.close.assert_called_once()
 
 
 if __name__ == "__main__":

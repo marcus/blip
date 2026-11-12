@@ -247,18 +247,38 @@ def messages_running() -> bool:
 
 def ensure_messages() -> str:
     """Start Messages if needed, WITHOUT bringing it forward (-g) or opening a
-    window (-j). Returns "" on success, else a reason."""
-    if messages_running():
-        return ""
-    try:
-        subprocess.run(["open", "-g", "-j", "-a", "Messages"], capture_output=True, timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return "could not start Messages"
+    window (-j). Returns "" on success, else a reason.
+
+    Success means System Events can DRIVE Messages, not that the process
+    exists. A background-launched Messages (-g -j: hidden, no window)
+    registers its menu bar seconds after its process does; probing inside
+    that gap answers "Can't get menu bar 1 … (-1719)". So this gate ends on
+    the same probe every later step uses, and a tapback that starts Messages
+    no longer races its own launch (2026-11-09: the tapback's `open -g -j`
+    and the failing System Events call sit 0.7 s apart in the unified log,
+    twice; every such failure cleared on the next try). Waiting only makes
+    sense where waiting can help: "the app or its UI is not up yet" is the
+    kind a second look fixes; a denial or a lock screen answers the same way
+    at every probe. So this gate neither starts Messages nor waits behind
+    those: it stays silent and lets accessibility() name them, as it always
+    did, which keeps every exit code as it was — 77 for a permission denied
+    or a locked screen, 69 for a Messages that would not start.
+    """
+    kind, why = accessibility_why()
+    if kind != "waiting":
+        return ""          # driveable (kind ""), or a denial/lock the next gate names, as always
+    if not messages_running():
+        try:
+            subprocess.run(["open", "-g", "-j", "-a", "Messages"], capture_output=True, timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return "could not start Messages"
     for _ in range(20):
-        if messages_running():
-            return ""
         subprocess.run(["sleep", "0.5"], capture_output=True)
-    return "Messages did not start"
+        if accessibility_why()[0] != "waiting":
+            return ""      # the menus are up, or the reason is no longer one waiting can fix
+    if not messages_running():
+        return "Messages did not start"
+    return ("Messages is up but System Events cannot reach its menus yet: " + why)
 
 
 SCREEN_LOCKED = ("the Mac's screen is locked, so System Events can reach no window; unlock it, or set "
@@ -284,18 +304,28 @@ def screen_locked() -> bool:
     return any(isinstance(u, dict) and bool(u.get("CGSSessionScreenIsLocked")) for u in users or [])
 
 
-def accessibility() -> str:
-    """"" when System Events can drive Messages, else why not."""
+def accessibility_why() -> tuple:
+    """Returns ("", "") when System Events can drive Messages, else (kind, why).
+
+    The kind matters: waiting can fix "waiting" — no process, or a process
+    whose UI (menu bar) has not registered with System Events yet — but a
+    denial repeats itself, and a lock screen hides everything until someone
+    types a password. ensure_messages waits only on the first."""
     code, out = osa(f'tell application "System Events" to tell process "Messages" to name of {MENU}')
     if code == 0:
-        return ""
+        return "", ""
     if "not allowed assistive" in out or "1002" in out or "osascript is not allowed" in out:
-        return ("Accessibility is not granted. System Settings ▸ Privacy & Security ▸ "
-                "Accessibility → add /usr/libexec/sshd-keygen-wrapper (the same entry "
-                "that has Full Disk Access).")
+        return "denied", ("Accessibility is not granted. System Settings ▸ Privacy & Security ▸ "
+                          "Accessibility → add /usr/libexec/sshd-keygen-wrapper (the same entry "
+                          "that has Full Disk Access).")
     if screen_locked():
-        return SCREEN_LOCKED
-    return out or "System Events could not reach Messages"
+        return "locked", SCREEN_LOCKED
+    return "waiting", out or "System Events could not reach Messages"
+
+
+def accessibility() -> str:
+    """"" when System Events can drive Messages, else why not."""
+    return accessibility_why()[1]
 
 
 def click(item: str) -> tuple[bool, str]:
@@ -497,10 +527,16 @@ SIDEBAR = {"--pin": "Pin", "--unpin": "Unpin"}
 # Only the direct children of the sidebar group ("Conversations") are
 # candidates, and only the one Messages reports as selected: a message bubble
 # offers a bare "Pin" of its own, which pins the MESSAGE, and must never match.
+# When no built row is selected (a far-down chat), it pages the list from the
+# top until the selected row exists, and returns the list to the top after.
 # Prints one word: done, already (the tile/row shows the asked-for state), or
 # none / error followed by a reason.
 SIDEBAR_JS = r"""
 ObjC.import('ApplicationServices');
+// ~10 rows a page, so 150 pages cover ~1500 conversations. A page that moves
+// returns as soon as the rows change (~0.35 s on the 27.0.1 mini); one that
+// does not waits 0.6 s and ends the walk.
+const MAX_PAGES = 150;
 function attr(el, name) {
   const ref = Ref();
   if ($.AXUIElementCopyAttributeValue(el, $(name), ref) !== 0) return null;
@@ -539,7 +575,37 @@ function run(argv) {
     for (const k of kids(el)) stack.push(k);
   }
   if (!list) return 'none the conversation list was not found';
-  const picked = kids(list).filter(k => attr(k, 'AXSelected') === true);
+  let picked = selected(list), moved = false;
+  if (picked.length === 0) {
+    // Messages builds only the rows near the viewport (~15), and `open
+    // imessage:` selects a far-down chat without scrolling its row into view
+    // (27.0.1 and 27.2, #132). Page from the top until the selected row is
+    // built, then put the list back at the top whatever happens.
+    moved = true;
+    picked = reveal(list);
+  }
+  const result = perform(picked, want);
+  if (moved) toTop(list);
+  return result;
+}
+function selected(list) { return kids(list).filter(k => attr(k, 'AXSelected') === true); }
+// One page in `dir`; false when the built rows did not change, which is the
+// end of the list in that direction. Rows build a beat after the action.
+function page(list, dir) {
+  const sig = () => kids(list).map(k => String(attr(k, 'AXDescription'))).join('\n');
+  const before = sig();
+  if ($.AXUIElementPerformAction(list, $(dir)) !== 0) return false;
+  for (let i = 0; i < 12; i++) { delay(0.05); if (sig() !== before) return true; }
+  return false;
+}
+function toTop(list) { for (let i = 0; i < MAX_PAGES && page(list, 'AXScrollUpByPage'); i++); }
+function reveal(list) {
+  toTop(list);
+  let picked = selected(list);
+  for (let i = 0; picked.length === 0 && i < MAX_PAGES && page(list, 'AXScrollDownByPage'); i++) picked = selected(list);
+  return picked;
+}
+function perform(picked, want) {
   if (picked.length !== 1) return 'none ' + picked.length + ' conversations are selected in the sidebar';
   const el = picked[0];
   const tile = String(attr(el, 'AXDescription') || '').endsWith(', Pinned');
@@ -592,6 +658,70 @@ def sidebar_action(item: str) -> tuple[bool, str]:
     if word == "none":
         return False, f"{item} is not in the Conversation menu or the sidebar ({why})"
     return False, why or out
+
+
+# macOS 27 refuses a tenth pin with a sheet on the Messages window ("You can
+# pin up to 9 conversations ..."), and the sidebar action itself still returns
+# success, so the helper above used to end in "clicked but not pinned" with the
+# sheet left open on the Mac (found live on the 27.2 gateway, 2026-11-09).
+# This reads that sheet's text. It presses the button only on a ONE-button sheet
+# whose text is about pinning; an alert of any other kind is somebody's decision,
+# so it is read out and left alone. Prints "none" or "alert <0|1 closed> <text>".
+PIN_ALERT_JS = r"""
+ObjC.import('ApplicationServices');
+function attr(el, name) {
+  const ref = Ref();
+  if ($.AXUIElementCopyAttributeValue(el, $(name), ref) !== 0) return null;
+  try { return ObjC.unwrap(ObjC.castRefToObject(ref[0])); } catch (e) { return null; }
+}
+function kids(el) {
+  const ref = Ref();
+  if ($.AXUIElementCopyAttributeValue(el, $('AXChildren'), ref) !== 0) return [];
+  const arr = ObjC.castRefToObject(ref[0]), out = [];
+  for (let i = 0; i < Number(arr.count); i++) out.push(arr.objectAtIndex(i));
+  return out;
+}
+function run(argv) {
+  const pid = Number(argv[0]);
+  if (!(pid > 0)) return 'none';
+  const app = $.AXUIElementCreateApplication(pid);
+  for (const win of kids(app).filter(k => attr(k, 'AXRole') === 'AXWindow')) {
+    for (const sheet of kids(win).filter(k => attr(k, 'AXRole') === 'AXSheet')) {
+      const text = kids(sheet).filter(k => attr(k, 'AXRole') === 'AXStaticText')
+        .map(k => String(attr(k, 'AXValue') || '')).filter(t => t !== '').join(' ').replace(/\s+/g, ' ').slice(0, 300);
+      const buttons = kids(sheet).filter(k => attr(k, 'AXRole') === 'AXButton');
+      let closed = 0;
+      if (buttons.length === 1 && /pin/i.test(text) && $.AXUIElementPerformAction(buttons[0], $('AXPress')) === 0) closed = 1;
+      return 'alert ' + closed + ' ' + text;
+    }
+  }
+  return 'none';
+}
+"""
+
+
+def pin_refusal() -> str:
+    """What Messages said when it would not pin, from the alert sheet it put up;
+    "" when there is none (or it cannot be read). Only asked after a pin that
+    did not land, so a pin that worked never touches the window again."""
+    pid = messages_pid()
+    if pid is None:
+        return ""
+    try:
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", PIN_ALERT_JS, str(pid)],
+                           capture_output=True, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return ""
+    out = (r.stdout or b"").decode("utf-8", "replace").strip()
+    word, _, rest = out.partition(" ")
+    if r.returncode != 0 or word != "alert":
+        return ""
+    closed, _, text = rest.partition(" ")
+    text = "".join(c for c in text if c.isprintable()).strip()[:300]
+    if not text:
+        return ""
+    return (f'Pin was clicked but Messages refused: "{text}" '
+            + ("(the alert was dismissed)" if closed == "1" else "(the alert was left open on the Mac)"))
 
 
 def conversation_action(flag: str, handle: str) -> None:
@@ -654,6 +784,11 @@ def conversation_action(flag: str, handle: str) -> None:
             sys.stderr.write(f"imsg-read: its unread state on the Mac may not have survived "
                              f"opening it ({lost})\n")
         restore_front(prev)
+    if flag == "--pin" and got is not want:
+        why = pin_refusal()
+        if why:
+            sys.stderr.write(f"imsg-read: {why}\n")
+            sys.exit(75)
     if got is None:
         sys.stderr.write(f"imsg-read: {item} was clicked but Messages' records cannot "
                          f"confirm the conversation is {word}\n")

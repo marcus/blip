@@ -23,8 +23,8 @@ import { openSync, writeSync, fsyncSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { appendFileSync, chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { mergeStickers, type StickerOverlay } from "./stickers";
 import { parseReadSnapshot, parseReadIntents, queueReadIntent, retryReadIntent, reconcileReadIntents,
   type ReadSnapshot, type ReadIntents } from "./read-sync";
@@ -230,6 +230,9 @@ export interface BlipOutput {
   /** Which reads are pushed to the Mac: "off", "all" (the mark-all gesture
    *  only — the default) or "thread" (also each conversation you open). */
   readPush: PushRead;
+  /** Whether anyone is logged in at the Mac's screen. "signed-out" means reads work and
+   *  sends cannot. Absent on a failed poll and from a collector that predates it. */
+  macSession?: MacSession;
 }
 
 // ---------------------------------------------------------------- state I/O
@@ -360,11 +363,28 @@ export function saveState(state: BlipState, path = STATE_PATH): boolean {
     try { writeSync(fd, JSON.stringify({ ...state, toasted: state.toasted.slice(-200) })); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(temp, path);
     chmodSync(path, 0o600);
+    sweepStaleTemps(path);
     return true;
   } catch {
     try { unlinkSync(temp); } catch { /* temp may not exist */ }
     return false;
   }
+}
+
+/** A collector killed between openSync and renameSync leaves `<state>.<pid>.tmp`
+ *  behind, and nothing ever reads it again (one sat in ~/.local/state/blip for two
+ *  months, 160 KB). The pid is no use as a liveness test across reboots, so age is:
+ *  a live writer finishes in milliseconds, and an hour is far past that. */
+export function sweepStaleTemps(path: string, now = Date.now(), maxAgeMs = 3600_000): void {
+  try {
+    const dir = dirname(path);
+    const prefix = basename(path) + ".";
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith(prefix) || !/^\d+\.tmp$/.test(name.slice(prefix.length))) continue;
+      const file = join(dir, name);
+      try { if (now - statSync(file).mtimeMs > maxAgeMs) unlinkSync(file); } catch { /* raced with its owner */ }
+    }
+  } catch { /* housekeeping never fails a save */ }
 }
 
 export function loadAllowlist(path = ALLOWLIST_PATH): string[] {
@@ -495,7 +515,7 @@ export function mergeTapbacks(a?: Tapback[] | null, b?: Tapback[] | null): Tapba
   });
 }
 
-function sentReceipt(a: Pick<ImsgMessage, "delivered" | "read_at"> | undefined, b: ImsgMessage): Pick<ImsgMessage, "delivered" | "read_at"> {
+function sentReceipt(a: Partial<ImsgMessage> | undefined, b: ImsgMessage) {
   const read_at = a?.read_at ?? b.read_at;
   return { ...(a?.delivered || b.delivered ? { delivered: true } : {}), ...(read_at ? { read_at } : {}) };
 }
@@ -512,19 +532,17 @@ export function dedupeSelfEcho(msgs: ImsgMessage[], knownSelfChats: string[] = [
   // message — whichever the reacting device considers the message. Whatever
   // is dropped below hands its tapbacks to the row that stays, so a reaction
   // on your own note is seen no matter which twin carried it.
+  const emptySentReceipt = new Map<string, Partial<ImsgMessage>>();
   const emptySentTapbacks = new Map<string, Tapback[] | undefined>();
   const emptySentStickers = new Map<string, StickerOverlay[] | undefined>();
   const emptySentActivity = new Map<string, string>();
-  // Delivery and read state live only on the sent row, so the row that stays
-  // takes them too, or a self-thread could never show its status line.
-  const emptySentReceipt = new Map<string, Pick<ImsgMessage, "delivered" | "read_at">>();
   for (const m of msgs) {
     if (selfChats.has(chatKey(m)) && m.from_me && m.text === "") {
       const k = contextKey(m);
+      emptySentReceipt.set(k, sentReceipt(emptySentReceipt.get(k), m));
       emptySentTapbacks.set(k, mergeTapbacks(emptySentTapbacks.get(k), m.tapbacks));
       emptySentStickers.set(k, mergeStickers(emptySentStickers.get(k), m.stickers));
       if (m.activity_ts && m.activity_ts > (emptySentActivity.get(k) ?? "")) emptySentActivity.set(k, m.activity_ts);
-      emptySentReceipt.set(k, sentReceipt(emptySentReceipt.get(k), m));
     }
   }
   const retractedSent = new Set(
@@ -556,8 +574,8 @@ export function dedupeSelfEcho(msgs: ImsgMessage[], knownSelfChats: string[] = [
         const kept = out[idx]!;
         const stickers = mergeStickers(kept.stickers, m.stickers);
         const activity = [kept.activity_ts ?? "", m.activity_ts ?? ""].sort().at(-1);
-        out[idx] = { ...kept, from_me: kept.from_me || m.from_me, tapbacks: mergeTapbacks(kept.tapbacks, m.tapbacks),
-          ...sentReceipt(kept, m), ...(stickers ? { stickers } : {}), ...(activity ? { activity_ts: activity } : {}) };
+        out[idx] = { ...kept, ...sentReceipt(kept, m), from_me: kept.from_me || m.from_me, tapbacks: mergeTapbacks(kept.tapbacks, m.tapbacks),
+          ...(stickers ? { stickers } : {}), ...(activity ? { activity_ts: activity } : {}) };
         continue;
       }
       selfText.set(key, out.length);
@@ -566,8 +584,8 @@ export function dedupeSelfEcho(msgs: ImsgMessage[], knownSelfChats: string[] = [
     if (emptySent.has(context) && !m.from_me) {
       const stickers = mergeStickers(m.stickers, emptySentStickers.get(context));
       const activity = [m.activity_ts ?? "", emptySentActivity.get(context) ?? ""].sort().at(-1);
-      out.push({ ...m, from_me: true, tapbacks: mergeTapbacks(m.tapbacks, emptySentTapbacks.get(context)),
-        ...emptySentReceipt.get(context), ...(stickers ? { stickers } : {}), ...(activity ? { activity_ts: activity } : {}) });
+      out.push({ ...m, ...emptySentReceipt.get(context), from_me: true, tapbacks: mergeTapbacks(m.tapbacks, emptySentTapbacks.get(context)),
+        ...(stickers ? { stickers } : {}), ...(activity ? { activity_ts: activity } : {}) });
       continue;
     }
     out.push(m);
@@ -2297,13 +2315,67 @@ export function runReadAction(args: string[], runner = spawnSync): { ok: boolean
   } catch { return { ok: false, error: "Mac read action could not start" }; }
 }
 
+/** The complete unread snapshot. It runs on EVERY poll, so it rides the persistent
+ *  channel like `recent` does: one-shot it paid a Python start and a database open
+ *  (~90 ms) on top of the query. A channel answer of 64 means the Mac's `serve`
+ *  predates `read-state` (the client was updated before the bridge); ask one-shot
+ *  instead of reporting the snapshot unavailable. */
 export function fetchReadSnapshot(runner = spawnSync): ReadSnapshot | null {
   try {
-    const r = runner(shimPath("imsg"), ["--json", "read-state"], {
-      encoding: "utf8", timeout: 20000, maxBuffer: 16 * 1024 * 1024,
-    });
+    const argv = ["--json", "read-state"];
+    const opts = { timeout: 20000, maxBuffer: 16 * 1024 * 1024 };
+    let r = bridgeRun(argv, runner, opts);
+    if (r.status === 64) {
+      const slow = runner(shimPath("imsg"), argv, { encoding: "utf8", ...opts });
+      r = { status: slow.status, stdout: String(slow.stdout ?? ""), stderr: String(slow.stderr ?? "") };
+    }
     return r.status === 0 ? parseReadSnapshot(JSON.parse(String(r.stdout))) : null;
   } catch { return null; }
+}
+
+// ---------------------------------------------------------------- Mac login session
+
+/** Is anyone logged in at the gateway Mac's screen? Sends cannot start Messages without a
+ *  GUI session (Launch Services error -10810, the 10 Nov WindowServer crash), while reads
+ *  keep working, so Blip used to find out only when a send failed. The answer is remembered
+ *  for a few seconds in its own file: no message content, just a state and a clock. */
+export const MAC_SESSION_PATH = `${HOME}/.local/state/blip/mac-session.json`;
+export type MacSession = "ok" | "signed-out" | "unknown";
+export const MAC_SESSION_FRESH_MS = 20_000;
+
+/** "unknown" is the default for anything that is not a clear yes or no: an older bridge, an
+ *  unreadable reply, a probe that could not run. Only a definite `gui:false` says signed-out,
+ *  because a banner that cries wolf is worse than none. */
+export function parseMacSession(stdout: string): MacSession {
+  try {
+    const v = JSON.parse(stdout);
+    if (!v || v.version !== 1) return "unknown";
+    return v.gui === true ? "ok" : v.gui === false ? "signed-out" : "unknown";
+  } catch { return "unknown"; }
+}
+
+export function fetchMacSession(runner = spawnSync): MacSession {
+  try {
+    const r = bridgeRun(["--json", "session"], runner, { timeout: 8000, maxBuffer: 4096 });
+    return r.status === 0 ? parseMacSession(String(r.stdout)) : "unknown";
+  } catch { return "unknown"; }
+}
+
+export function checkMacSession(runner = spawnSync, path = MAC_SESSION_PATH, now = Date.now()): MacSession {
+  try {
+    const c = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof c?.at === "number" && now - c.at >= 0 && now - c.at < MAC_SESSION_FRESH_MS &&
+        (c.state === "ok" || c.state === "signed-out" || c.state === "unknown")) return c.state;
+  } catch { /* no cache, or one that is not ours: ask */ }
+  const state = fetchMacSession(runner);
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const temp = `${path}.${process.pid}.tmp`;
+    writeFileSync(temp, JSON.stringify({ state, at: now }), { mode: 0o600 });
+    renameSync(temp, path);
+    sweepStaleTemps(path);
+  } catch { /* an unwritable cache only costs one more probe */ }
+  return state;
 }
 
 export function collect(deep: boolean, markRead = false, readChat = "", seenTs = "", unreadChat = "", explicitRead = false): BlipOutput {
@@ -2668,6 +2740,8 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
     // and impossible to tell apart from a broken push without this (Fred,
     // 2026-09-08: "they are not marking them read on my iphone").
     readPush,
+    // Cached for 20 s, so this is one probe in about four polls, not one per poll.
+    macSession: checkMacSession(),
   };
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +22,11 @@ import {
   displayName,
   messagePreview,
   fetchMessages,
+  fetchReadSnapshot,
+  parseMacSession,
+  fetchMacSession,
+  checkMacSession,
+  MAC_SESSION_FRESH_MS,
   loadAllowlist,
   loadMutelist,
   matchesMute,
@@ -37,6 +42,7 @@ import {
   applyPins,
   maxTs,
   saveState,
+  sweepStaleTemps,
   selectToasts,
   toastKey,
   windowCutoff,
@@ -857,6 +863,93 @@ describe("state and allowlist I/O", () => {
   });
 });
 
+describe("Mac login session", () => {
+  const reply = (gui: unknown, version: unknown = 1) => JSON.stringify({ version, gui });
+  const ok = (stdout: string) => ({ status: 0, stdout, stderr: "" }) as never;
+  const cachePath = () => join(mkdtempSync(join(tmpdir(), "blip-session-")), "mac-session.json");
+
+  test("only a definite gui:false says signed-out; everything unclear is unknown", () => {
+    expect(parseMacSession(reply(true))).toBe("ok");
+    expect(parseMacSession(reply(false))).toBe("signed-out");
+    for (const body of [reply(null), reply("no"), reply(0), reply(undefined), reply(true, 2), JSON.stringify({ gui: false }),
+      "", "not json", "null", "[]", "{}"]) {
+      expect(parseMacSession(body)).toBe("unknown");
+    }
+  });
+
+  test("asks the bridge for `session`, and a failure or an older bridge is unknown, never signed-out", () => {
+    const calls: string[][] = [];
+    expect(fetchMacSession(((cmd: string, args: string[]) => { calls.push(args); return ok(reply(false)); }) as never)).toBe("signed-out");
+    expect(calls[0]).toEqual(["--json", "session"]);
+    for (const status of [1, 64, 69, 255, null]) {
+      expect(fetchMacSession((() => ({ status, stdout: reply(false), stderr: "" })) as never)).toBe("unknown");
+    }
+    expect(fetchMacSession((() => { throw new Error("spawn failed"); }) as never)).toBe("unknown");
+  });
+
+  test("the answer is remembered for 20 s, then asked again", () => {
+    const path = cachePath();
+    let calls = 0;
+    const runner = (() => { calls++; return ok(reply(false)); }) as never;
+    const t0 = 1_800_000_000_000;
+    expect(checkMacSession(runner, path, t0)).toBe("signed-out");
+    expect(checkMacSession(runner, path, t0 + MAC_SESSION_FRESH_MS - 1)).toBe("signed-out");
+    expect(calls).toBe(1);
+    expect(checkMacSession((() => { calls++; return ok(reply(true)); }) as never, path, t0 + MAC_SESSION_FRESH_MS)).toBe("ok");
+    expect(calls).toBe(2);
+  });
+
+  test("a clock that went backwards, or a cache that is not ours, is not trusted", () => {
+    const path = cachePath();
+    writeFileSync(path, JSON.stringify({ state: "signed-out", at: 2_000_000_000_000 }));
+    expect(checkMacSession((() => ok(reply(true))) as never, path, 1_800_000_000_000)).toBe("ok");   // `at` is in the future
+    for (const junk of ["not json", "[]", JSON.stringify({ state: "banana", at: 1_800_000_000_000 }),
+      JSON.stringify({ state: "signed-out" }), JSON.stringify({ state: "signed-out", at: "now" })]) {
+      writeFileSync(path, junk);
+      expect(checkMacSession((() => ok(reply(true))) as never, path, 1_800_000_000_000)).toBe("ok");
+    }
+  });
+
+  test("the cache file is private and holds a state and a clock, nothing else", () => {
+    const path = cachePath();
+    checkMacSession((() => ok(reply(false))) as never, path, 1_800_000_000_000);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ state: "signed-out", at: 1_800_000_000_000 });
+  });
+
+  test("an unwritable cache directory still answers", () => {
+    expect(checkMacSession((() => ok(reply(false))) as never, "/proc/blip-nope/mac-session.json", 1_800_000_000_000)).toBe("signed-out");
+  });
+});
+
+describe("stale atomic-write leftovers", () => {
+  const fresh = () => { const d = mkdtempSync(join(tmpdir(), "blip-sweep-")); return { d, state: join(d, "state.json") }; };
+  const plant = (path: string, ageMs: number) => {
+    writeFileSync(path, "{}");
+    const t = (Date.now() - ageMs) / 1000;
+    utimesSync(path, t, t);
+  };
+
+  test("a save removes an hour-old state.json.<pid>.tmp and keeps everything else", () => {
+    const { d, state } = fresh();
+    plant(join(d, "state.json.3447586.tmp"), 2 * 3600_000);     // the real one: a crash, two months ago
+    plant(join(d, "state.json.99.tmp"), 60_000);                // a writer that is running right now
+    plant(join(d, "state.json.bak"), 9 * 3600_000);             // not ours: no pid, no .tmp
+    plant(join(d, "window.json.123.tmp"), 9 * 3600_000);        // another file's temp
+    plant(join(d, "state.json.12x.tmp"), 9 * 3600_000);         // pid must be digits
+    plant(join(d, "AAAAAAAAAAA123.tmp"), 9 * 3600_000);         // digits after a prefix-length stem, but not our file
+    expect(saveState({ ...loadState(state) }, state)).toBe(true);
+    expect(existsSync(join(d, "state.json.3447586.tmp"))).toBe(false);
+    for (const keep of ["state.json.99.tmp", "state.json.bak", "window.json.123.tmp", "state.json.12x.tmp", "AAAAAAAAAAA123.tmp", "state.json"]) {
+      expect(existsSync(join(d, keep))).toBe(true);
+    }
+  });
+
+  test("an unreadable directory never fails the save or the sweep", () => {
+    expect(() => sweepStaleTemps("/nonexistent-dir-for-blip/state.json")).not.toThrow();
+  });
+});
+
 describe("fetchMessages", () => {
   const fake = (r: { status: number; stdout?: string; stderr?: string }) =>
     (() => ({ status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" })) as never;
@@ -911,6 +1004,49 @@ describe("fetchMessages", () => {
     const r = fetchMessages(10, fake({ status: 0, stdout: '{"oops":true}' }));
     expect(r.ok).toBe(false);
     expect(r.error).toContain("bad JSON");
+  });
+});
+
+describe("fetchReadSnapshot", () => {
+  const snapshot = JSON.stringify({ version: 1, chats: [
+    { chat: "+15551234567", unread: 2, oldest: "2026-11-10T10:00:00Z", latest: "2026-11-10T11:00:00Z", aliases: [] },
+    { chat: "chat0123", unread: 0, oldest: "", latest: "2026-11-09T11:00:00Z", aliases: ["chat0456"] },
+  ] });
+  const ok = (stdout: string) => ({ status: 0, stdout, stderr: "" }) as never;
+
+  test("asks the bridge for the snapshot as JSON and parses every row", () => {
+    const calls: string[][] = [];
+    const got = fetchReadSnapshot(((cmd: string, args: string[]) => { calls.push([cmd, ...args]); return ok(snapshot); }) as never);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.slice(1)).toEqual(["--json", "read-state"]);
+    expect(got).toEqual({
+      "+15551234567": { unread: 2, oldest: "2026-11-10T10:00:00Z", latest: "2026-11-10T11:00:00Z", aliases: [] },
+      "chat0123": { unread: 0, oldest: "", latest: "2026-11-09T11:00:00Z", aliases: ["chat0456"] },
+    });
+  });
+
+  test("a serve channel that predates read-state (status 64) is asked again one-shot", () => {
+    let n = 0;
+    const got = fetchReadSnapshot((() => (++n === 1
+      ? { status: 64, stdout: "serve: 'read-state' is not available on this channel\n", stderr: "" }
+      : { status: 0, stdout: snapshot, stderr: "" })) as never);
+    expect(n).toBe(2);
+    expect(Object.keys(got ?? {})).toEqual(["+15551234567", "chat0123"]);
+  });
+
+  test("any other failure is 'unavailable', never a guess and never a retry", () => {
+    for (const status of [1, 69, 255, null]) {
+      let n = 0;
+      expect(fetchReadSnapshot((() => { n++; return { status, stdout: snapshot, stderr: "" }; }) as never)).toBeNull();
+      expect(n).toBe(1);
+    }
+  });
+
+  test("a body that is not a version-1 snapshot is unavailable", () => {
+    for (const body of ["not json", "{}", JSON.stringify({ version: 2, chats: [] }),
+      JSON.stringify({ version: 1, chats: [{ chat: "x", unread: 1, oldest: "", latest: "2026-11-10T11:00:00Z" }] })]) {
+      expect(fetchReadSnapshot((() => ok(body)) as never)).toBeNull();
+    }
   });
 });
 

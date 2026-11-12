@@ -16,8 +16,8 @@
  * at 500 MB, evicted after each write.
  */
 
-import { shimPath } from "./shim-path";
 import { analyzeAudio, type AudioMetadata } from "./audio-metadata";
+import { shimPath } from "./shim-path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
@@ -294,9 +294,9 @@ export function stickerAnimationPreview(bytes: Buffer, runner = spawnSync, dir =
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const fd = openSync(tmp, "wx", 0o600);
     try { writeSync(fd, bytes); } finally { closeSync(fd); }
-    const res = runner("ffmpeg", ["-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-f", "apng", "-ignore_loop", "1", "-i", tmp,
+    const res = runner("ffmpeg", ["-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-max_pixels", "4194304", "-f", "apng", "-ignore_loop", "1", "-i", tmp,
       "-map_metadata", "-1", "-c:v", "libwebp_anim", "-lossless", "1", "-loop", "0",
-      "-frames:v", "100", "-f", "webp", "pipe:1"],
+      "-frames:v", String(Math.min(100, Math.floor(64_000_000 / (size.pixelWidth * size.pixelHeight)))), "-f", "webp", "pipe:1"],
     { timeout: 30000, maxBuffer: FETCH_MAX_BYTES + (1 << 20) });
     const out = res.stdout as Buffer;
     if (res.status === 0 && Buffer.isBuffer(out) && out.length > 30 && imageAnimation(out).format === "webp")
@@ -322,7 +322,7 @@ export function stickerSequencePreview(bytes: Buffer, mime: string, runner = spa
     try { writeSync(fd, bytes); } finally { closeSync(fd); }
     const probe = runner("ffprobe", ["-v", "error", "-protocol_whitelist", "file,pipe",
       "-show_entries", "stream=index,codec_type,width,height,nb_frames,duration,pix_fmt",
-      "-of", "json", tmp], { timeout: 10000, maxBuffer: 65536 });
+      "-of", "json", "-max_pixels", "4194304", "-f", "mov", "-i", tmp], { timeout: 10000, maxBuffer: 65536 });
     if (probe.status !== 0) return undefined;
     const data = JSON.parse(String(probe.stdout));
     if (!Array.isArray(data.streams) || data.streams.length > 8) return undefined;
@@ -341,10 +341,10 @@ export function stickerSequencePreview(bytes: Buffer, mime: string, runner = spa
       ? `[0:${color.index}][0:${mask.index}]alphamerge,format=rgba[out]`
       : `[0:${color.index}]format=rgba[out]`;
     const output = animate
-      ? ["-c:v", "libwebp_anim", "-lossless", "1", "-loop", "0", "-frames:v", "100", "-t", "8", "-f", "webp"]
+      ? ["-c:v", "libwebp_anim", "-lossless", "1", "-loop", "0", "-frames:v", String(Math.min(100, Math.floor(64_000_000 / (width * height)))), "-t", "8", "-f", "webp"]
       : ["-c:v", "png", "-frames:v", "1", "-f", "image2pipe"];
     const result = runner("ffmpeg", ["-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
-      "-threads", "1", "-i", tmp, "-filter_complex_threads", "1", "-filter_complex", filter,
+      "-threads", "1", "-max_pixels", "4194304", "-f", "mov", "-i", tmp, "-filter_complex_threads", "1", "-filter_complex", filter,
       "-map", "[out]", "-an", "-map_metadata", "-1", ...output, "pipe:1"],
     { timeout: 30000, maxBuffer: FETCH_MAX_BYTES + (1 << 20) });
     const out = result.stdout as Buffer;
@@ -510,6 +510,7 @@ export function bakeOrientation(bytes: Buffer, runner = spawnSync): Buffer {
 }
 
 export interface FetchResult {
+  audio?: AudioMetadata;
   ok: boolean;
   online: boolean;
   path: string;
@@ -524,7 +525,6 @@ export interface FetchResult {
   /** A transparent still is available, but its source animation could not be decoded. */
   animationUnavailable: boolean;
   /** Real decoded envelope, kept in memory; absent for non-audio media. */
-  audio?: AudioMetadata;
 }
 
 /** An iPhone voice message (CAF, Opus inside) → Ogg Opus, so the default
@@ -581,16 +581,20 @@ export function fetchAttachment(
   const rawFile = join(CACHE_DIR, cacheFileName(id, name, mime, preview, sticker));
   const animationFile = join(CACHE_DIR, cacheFileName(id, name, "image/webp").replace(`${id}-orig-`, `${id}-anim-`));
   const stillFile = join(CACHE_DIR, cacheFileName(id, name, "image/png").replace(`${id}-orig-`, `${id}-still-`));
+  const failedFile = stillFile + ".failed";
+  if (sequencePreview && cachedMediaBytes(failedFile, 16)?.toString() === "unavailable") {
+    try { if (Date.now() - lstatSync(failedFile).mtimeMs < 3600000) return fail("sticker preview unavailable; open the original attachment"); } catch {}
+  }
   let file = rawFile;
   let cachedRaw: Buffer | undefined;
   let renderMime = png ? "image/png" : preview || wantsJpeg(mime) ? "image/jpeg" : mime;
   const sequenceStill = png && !["image/heic", "image/heif"].includes(mime.toLowerCase());
   const candidates = sequencePreview ? [animationFile, stillFile].concat(png ? [rawFile] : [])
-    : animatedPreview ? [animationFile, rawFile] : [rawFile];
+    : animatedPreview ? [animationFile, stillFile, rawFile] : [rawFile];
   for (const candidate of candidates) try {
     const st = lstatSync(candidate);
     // A symlink planted in the cache must never be followed (or touched).
-    if (st.isFile() && st.size > 0 && st.size <= Math.min(maxBytes, FETCH_MAX_BYTES)) {
+    if (st.isFile() && st.size > 0 && st.size <= (sticker ? Math.min(maxBytes, FETCH_MAX_BYTES) : FETCH_MAX_BYTES)) {
       const now = new Date();
       utimesSync(candidate, now, now); // mtime is the LRU clock
       const cachedMime = candidate === animationFile ? "image/webp" : candidate === stillFile ? "image/png" : renderMime;
@@ -602,11 +606,13 @@ export function fetchAttachment(
         cachedRaw = cachedMediaBytes(candidate, Math.min(maxBytes, FETCH_MAX_BYTES));
         if (cachedRaw) break; // convert an already cached APNG without another bridge read
       }
+      const audio = String(mime).toLowerCase().startsWith("audio/") ? analyzeAudio(candidate, runner) : undefined;
+      if (audio) evict(candidate.slice(candidate.lastIndexOf("/") + 1));
       return {
+        ...(audio ? {audio} : {}),
         ok: true, online: true, path: candidate, url: pathToFileURL(candidate).href, error: "",
         renderMime: cachedMime, ...metrics,
         animationUnavailable: candidate !== animationFile && (sequenceStill || candidate === stillFile || metrics.animationUnavailable),
-        ...(mime.startsWith("audio/") ? { audio: analyzeAudio(candidate, runner) } : {}),
       };
     }
   } catch { /* not cached */ }
@@ -622,7 +628,7 @@ export function fetchAttachment(
   const args = [
     "attachment", id,
     ...(png && !sequencePreview ? ["--png"] : !sequencePreview && (wantsJpeg(mime) || preview) ? ["--jpeg"] : []),
-    ...(preview ? ["--max-dim", String(PREVIEW_MAX_DIM)] : []),
+    ...(png && !sequencePreview ? ["--max-dim", "2048"] : preview ? ["--max-dim", String(PREVIEW_MAX_DIM)] : []),
   ];
   const res = cachedRaw ? { status: 0, stdout: cachedRaw, stderr: "" } : runner(shimPath("imsg"), args, {
     timeout: 120000,
@@ -650,7 +656,7 @@ export function fetchAttachment(
     } else if (png) {
       // A missing ffmpeg, unknown HEICS layout, or oversized preview still
       // gets the Mac's transparent first image. Never cache raw HEICS as PNG.
-      const fallback = runner(shimPath("imsg"), ["attachment", id, "--png"],
+      const fallback = runner(shimPath("imsg"), ["attachment", id, "--png", "--max-dim", "2048"],
         { timeout: 120000, maxBuffer: FETCH_MAX_BYTES + (1 << 20) });
       if (fallback.status === 69 || fallback.status === 255) return fail("Mac unreachable", false);
       const still = fallback.stdout as Buffer;
@@ -660,6 +666,11 @@ export function fetchAttachment(
       bytes = still;
       animationUnavailable = true;
     } else {
+      try {
+        const fd = openSync(failedFile, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_TRUNC, 0o600);
+        try { writeSync(fd, "unavailable"); } finally { closeSync(fd); }
+        evict(failedFile.slice(failedFile.lastIndexOf("/") + 1));
+      } catch { /* the failure itself must still be reported */ }
       return fail("sticker video preview unavailable; open the original attachment");
     }
   }
@@ -674,6 +685,7 @@ export function fetchAttachment(
       } else animationUnavailable = true;
     }
   }
+  if (animatedPreview && animationUnavailable) file = stillFile;
   if (sticker && !renderMime.startsWith("video/") && !stickerRasterValid(bytes.subarray(0, IMAGE_HEADER_BYTES), renderMime))
     return fail("sticker media is not a supported bounded raster image");
 
@@ -691,12 +703,13 @@ export function fetchAttachment(
   renameSync(tmp, file);
   evict(file.slice(file.lastIndexOf("/") + 1));
   const animation = imageAnimation(bytes.subarray(0, IMAGE_HEADER_BYTES));
+  const audio = String(mime).toLowerCase().startsWith("audio/") ? analyzeAudio(file, runner) : undefined;
   return {
+    ...(audio ? {audio} : {}),
     ok: true, online: true, path: file, url: pathToFileURL(file).href, error: "",
     ...imageMetrics(bytes.subarray(0, IMAGE_HEADER_BYTES), renderMime), renderMime,
     animated: animation.animated && animation.format !== "png",
     animationUnavailable: animationUnavailable || (animation.animated && animation.format === "png"),
-    ...(mime.startsWith("audio/") ? { audio: analyzeAudio(file, runner) } : {}),
   };
 }
 

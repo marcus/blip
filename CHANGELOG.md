@@ -45,6 +45,171 @@
 
 ## Unreleased
 
+- **Shared city works on a macOS 27.2 gateway (#152 follow-up).** Find My on 27.2 writes a People row as plain text with
+  commas ("Name, 1 mi, Boston, MA · Now") where 27.0 and 27.1 used a button with dots, so the reader found no rows and
+  every header kept the phone number. It now reads both layouts and rewrites the new one to the old shape before any
+  check runs, so every privacy rule is unchanged: no Home, no street, no Paused, a unique contact match, a 24-hour limit.
+  Proven on the gateway with no name or place printed: two people read, one yields a city. One more thing it needs from
+  you: Find My has to be on its People tab, and Blip never switches tabs for you (press People once; it remembers).
+- **React to any message, with any emoji, on macOS 27.2 (#159, Marcus Vorwaller).** macOS 27 took the tapback actions off
+  message bubbles, so Blip could only react to the newest message. It now opens the Tapback Picker on the bubble you chose,
+  whichever it is, and presses the classic button there; a custom emoji is chosen through a searchable picker (a smiley in
+  the bubble's menu) and confirmed against chat.db, which stores the exact emoji, so a 🦊 is never mistaken for a 😀. A
+  reacted bubble reads "ok, Ann loved this" on the Mac, which Blip now understands, and a message whose own text looks like
+  that is refused rather than guessed. Opt-in as before (`tapbacks=on`). Needs macOS 27.2 or newer for the picker; 27.0
+  and 27.1 refuse before Messages opens, and a Mac without the event-posting permission refuses a custom emoji before any
+  picker opens. The custom-emoji press is one mouse click at the emoji's verified position (the picker ignores an AX
+  press on 27.2): it is refused if a button or modifier is held, never retried, and the pointer is put back. Proven on the
+  real 27.2 gateway in the self-thread only: a Heart on a month-old message, a 🦊, a reaction on an already-reacted bubble,
+  and removal, each confirmed in chat.db.
+- **Tapbacks no longer hang on a macOS 27.2 gateway.** Before every reaction the Mac asks macOS, without ever
+  prompting, whether the bridge may automate System Events. Over ssh on 27.2 that question never came back: it named
+  System Events by bundle id, a lookup ssh sessions on 27.2 cannot make, and Apple's call has no timeout, so the
+  reaction sat in the Messages lock for minutes before touching anything. It now names System Events by process id and
+  gives up after 5 seconds, which refuses ("cannot confirm"), as any other unknown answer does. Measured on the gateway:
+  blocked past 15 s before, granted in 0.15 s after. Nothing was ever pressed while it hung.
+  The first reaction after a Mac reboot is no longer refused either: a System Events that has just launched has a pid
+  at once but answers "not running" for about a second, so the check now asks again until it answers.
+- **Voice messages play inline, with a real waveform and seeking (#163, Marcus Vorwaller).** An audio attachment gets
+  play/pause, a waveform measured from the recording itself, remaining time, click and keyboard seeking, and only one voice
+  plays at a time. Playback belongs to the view, so a new message arriving no longer cuts off the one you are hearing, and
+  closing the panel or switching conversations stops it. Qt only ever opens a WAV Blip generated: ffmpeg decodes with the
+  container format named, and the audio starts at byte 4096 behind Blip's own header, so FFmpeg's format guess sees only
+  Blip's bytes (my review reproduced an MPEG-TS video hidden in a genuine WAV reaching Qt; on the merged code FFmpeg reads
+  that file as plain WAV). Recordings over ten minutes, or ones whose length cannot be confirmed, play through mpv with the
+  format forced, and mpv now stops when you leave. Needs `ffmpeg`, plus `qt6-multimedia` and `qt6-multimedia-ffmpeg` for
+  inline playback (without them a voice message is a chip, as before); `blip-setup` says what is missing.
+- **Stickers render as stickers (#162, Marcus Vorwaller).** A sticker used to be an empty bubble or a made-up star
+  tapback. Now it is drawn on the message it was dragged onto, at the position, size and angle Messages recorded, or on
+  its own when it stands alone; Memoji, Genmoji and app stickers say what they are to a screen reader. GIF, APNG and
+  WebP stickers play inline (an APNG is converted to a lossless animated WebP, because Qt draws APNG as a still), and a
+  Live Sticker (HEICS) becomes an animated WebP through ffmpeg, or the Mac's transparent still when ffmpeg is missing.
+  Everything is bounded: 2048 px, a 64M-pixel animation budget, 100 frames, 8 seconds, a cache that remembers a failed
+  preview for an hour. ffprobe and ffmpeg are told the container format before they see the file (my review reproduced a
+  two-line text file sent as a video making ffmpeg read a different picture from disk; that no longer works). Needs
+  `ffmpeg` for animation and `qt6-imageformats` for WebP; `blip-setup` says which is missing. Known limit: ffmpeg now
+  decodes sender-supplied video stickers on your machine without a click; running it sandboxed is requested of Marcus.
+- **A conversation loads in about a tenth of the Mac time (9b4f8d9).** Folding reactions onto messages read every
+  reaction in chat.db, a scan of all 282,650 messages, for every conversation open and every push reload: 93 ms of a
+  100 ms load. It now reads only reactions stamped from the window's oldest message minus 90 days, which Apple's own
+  `message_idx_date` answers in 2 ms (6 ms for a three-month-old window, 24 ms for a year-old one). Measured on the real
+  gateway: a typical window 103 ms to 7 ms, a 3,200-row window 126 ms to 32 ms. The answer is identical, not
+  approximately: 90 real windows (4,440 rows, 421 reactions) hash-equal against the old query, 1,200 seeded random
+  databases agree with it, ten mutations each fail a test, and a plan test fails if the planner stops using the index.
+  The margin is deliberate: 3 of 28,305 real reactions are stamped before the message they react to, the worst by 0.83
+  days, so a plain "reactions come later" bound would have dropped real ones. Limit, tested: a reaction stamped more
+  than 90 days before its message is not read.
+- **Blip says the Mac is signed out before a send fails.** When the gateway Mac is at its login window (a logout, or the
+  10 Nov WindowServer crash; FileVault means only you can log back in) reading keeps working, because that is plain
+  sqlite over ssh, and every send fails with Launch Services error -10810. Blip found out only when a send died. The
+  Mac now answers a read-only `imsg session` (`launchctl print gui/<uid>`: exit 0 while someone is logged in at the
+  screen, 112 "Could not find domain" when not; under 10 ms, touches no app, asks for no permission). The collector
+  asks over the persistent channel at most every 20 s, keeps the answer in `~/.local/state/blip/mac-session.json`
+  (a state and a clock, 0600, nothing else), and when it is a definite "signed out" the list and the composer each
+  show one line: "The Mac is signed out: Blip can read, but cannot send until you log in at the Mac." Anything
+  unclear (an older bridge, a probe that failed or timed out, an unreadable reply) is "unknown" and shows nothing,
+  because a notice that cries wolf is worse than none; an unreachable Mac says that instead. `status` adds
+  `mac_session=signed-out` only when it is. Tests: the probe's exit codes, the argv, the timeout and the unknown
+  cases on the Mac; the parse, the 20 s cache, a clock that went backwards, junk cache files and the 0600 mode in
+  the collector; the two notices and the `online &&` gate in the view; each has a mutation that fails one.
+  Deploy: `imsg` on the gateway and the plugin files (`collector.ts`, `BarWidget.qml`, `BlipView.qml`); a plugin
+  against an older Mac simply never shows the notice.
+- **A sent message shows Delivered until it is Read** (#158, Marcus Vorwaller). iMessage says Delivered under your
+  newest message and Blip said nothing until it was read. `imsg --rich` now adds `delivered` for your own iMessage and
+  RCS rows (`message.is_delivered`), and the receipt belongs to the newest sent message only: Delivered, then Read with
+  the existing time label. Failed, withdrawn and scheduled rows never claim it, Carrier SMS is unchanged, a message you
+  send yourself keeps its receipt in either echo order, and an older bridge that omits `delivered` still shows Read.
+  The old rule put Read under the newest READ message, which a later unread send left stale, so one test now says
+  "newest sent message". Deploy: the plugin files and `imsg` on the gateway.
+- **A searchable emoji picker beside Send** (#161, Marcus Vorwaller). A smiley opens a Unicode catalogue: search by
+  name, nine categories, an exact pasted sequence always first, arrow keys and Enter. Choosing an emoji replaces the
+  selection or inserts at the caret and returns focus to the composer without sending; Escape keeps the draft. The
+  grid is a `GridView` over a JS array, so only the visible cells exist. It adds a generated 327 KB catalogue module
+  from licensed data (the Unicode and Beeper/Automattic MIT notices ship in `docs/`). Rendered in a clean Omarchy VM on
+  invented data: themed popup, search, categories. An emoji newer than the installed font draws as an empty box.
+  Deploy: the plugin files (`ComposerEmojiPicker.qml`, `EmojiPicker.mjs`, `emoji-picker.ts`, `emoji-catalogue.ts`).
+- **A poll costs a fraction of what it did: the unread snapshot and the chat list stop reading the whole message
+  table.** Every poll ran `imsg read-state`, one window function over all 144,621 inbound messages on the
+  gateway's 530 MB chat.db (about 600 ms, and it grows with history). While the window or panel is open every
+  poll is a deep poll that also runs `imsg chats`, whose newest-message lookup ordered by an expression and so
+  scanned each of ~300 conversations whole. `read_state()` now finds the few chats that can have anything unread
+  from Apple's own `message_idx_is_read` index (24 rows of 144,621), runs the unchanged window query over only
+  those, and takes every other chat's newest inbound date from `chat_message_join`'s
+  `(chat_id, message_date, message_id)` index: 600 ms to 17 ms. `cmd_chats` takes each chat's newest visible
+  message from the same index: 1.0 to 1.3 s to 0.33 s. The old `read_state` stays as `read_state_scan`, the
+  fallback for a schema without `message_date`, for a predicate that reaches the message table and for more than
+  400 candidate chats, and the oracle the tests hold the new one to. End to end on gus, wall clock of a collector run:
+  a shallow poll 0.77 s to 0.2 s, a deep poll (window or panel open) 2.1 s to 1.0 s; what is left is the exact
+  per-chat message count in `chats` (238 ms) and the 616 KB `groups` reply, both left alone on purpose. The output is identical on the real
+  database: compared for the snapshot over four variants and byte for byte for the chat list over five.
+  `read-state` also joins the persistent `serve` channel, so a poll no longer pays a Python start and a database
+  open for it; a Mac whose `serve` predates it answers 64 and the client asks one-shot. `saveState()` removes
+  `state.json.<pid>.tmp` files an hour old (a 160 KB one from 14 Sep was still there). One edge is corrected on
+  the way: a stray NULL schedule column used to outrank a newer ordinary row in `cmd_chats` (`ORDER BY` sorts
+  NULL first); Messages writes 0, never NULL, so real data is unchanged. Tests: 1,500 random databases against
+  the oracle, join-index previews against the expression query, `fetchReadSnapshot`, the temp sweep; each new
+  branch has a mutation that fails one. Deploy: `read_state.py` and `imsg` to the gateway (`~/.blip/bin`, via
+  `install.sh`) and `collector.ts` to the plugin; the wire format is unchanged, so any order works.
+- **A failed send clears itself when the same words are delivered later.** A failed attempt used to stay on
+  screen for the life of the shell, so after the gateway Mac was logged back in and the retry went out, a red
+  "Not Delivered" bubble still sat under a message that had been delivered (10 Nov). `withPendingSends()` now
+  drops a failed attempt when a real row from you with the same text, strictly newer than the attempt, is in the
+  thread, for every earlier failed attempt of those words. A copy in the same second, an older copy, a row
+  Apple itself marked failed and a withdrawn row still do not count, and the attempt does not use up the row,
+  so an in-flight send of the same words can still claim it. Four new tests; three mutations each fail one.
+  Deploy: `thread.ts` (the QML view reads it through `bun thread.ts`); nothing on the Mac.
+- **A send that fails because nobody is logged in on the Mac now says so.** On 10 Nov the gateway's WindowServer
+  died (macOS 27.2 beta, build 26B5091g) and loginwindow logged the user out, which leaves no GUI session to launch
+  anything into. Every send then showed Messages' launch failure as raw osascript text, "execution error: An error
+  of type -10810 has occurred. (-10810)", and nothing in it named the cause. `friendlySendError()` in
+  `send-state.ts` turns exactly that code into "Messages can't start on the Mac: nobody is logged in there. Log in
+  on the Mac, then send again." for the failed bubble, the status line and a failed file send. Every other error
+  keeps the Mac's own wording; a guess at an unproven code would be worse than the number. Two new tests, both
+  killed by a mutation. Deploy: the plugin files only (`BlipView.qml`, `SendState.mjs`, `send-state.ts`), nothing
+  on the Mac.
+- **A pin Messages refuses says why, and its alert is dismissed.** Messages allows nine pinned conversations.
+  On macOS 27 a tenth pin puts up an alert sheet ("You can pin up to 9 conversations. To pin this conversation,
+  unpin another one first.") while the sidebar action itself still reports success, so `imsg-read --pin` ended
+  in "clicked but the conversation is not pinned" and left the sheet open on the Mac (found live on the 27.2
+  gateway, 9 Nov, while testing #154). After a pin that did not land, `imsg-read` now reads the Messages
+  window's sheet and reports Messages' own words as the error (exit 75, unchanged). It presses the button only
+  on a one-button sheet whose text is about pinning; any other alert is read out and left alone. Thirteen new
+  tests, one of them running the real JXA under bun against a fake AX tree. Deploy: `bridge/mac/imsg-read` to
+  the Mac.
+
+- **A tapback failure names its real reason instead of "Mac unreachable" (#155, thanks @lama7).** Exit 69
+  was two failures sharing one code: `blip-shim`'s translation of ssh's 255 (the bridge is down) and
+  `imsg-react`'s own `EX_UNAVAILABLE` for Mac-local states it already states on stderr (screen locked,
+  Messages started with no window). `tapbackFailure` called every 69 transport, so a reachable Mac with a
+  locked screen read "tapback: Mac unreachable" for days while sends through the same bridge worked. A 69 is
+  now unreachable only when the shim's own marker line is on stderr or no `imsg-react:` line ran at all;
+  otherwise the status line shows the tool's reason. 255 stays ssh, always. One new test, and a note under the
+  `blip-shim` exit-code invariant in `CLAUDE.md`.
+
+- **A tapback that has to start Messages lands on the first try (#157, thanks @lama7).** `imsg-read`'s
+  `ensure_messages()` treated "the Messages process exists" as ready, but a background launch (`open -g -j`)
+  puts the process on the list seconds before System Events can see its menu bar, so the very next probe
+  answered `Can't get menu bar 1 of process "Messages" (-1719)` and the tapback failed with exit 77; it worked
+  a minute later. Success now means System Events can drive Messages: the gate polls the same menu-bar probe
+  (20 x 0.5 s) after starting it. A denial or a locked screen answers the same at every probe, so the gate
+  neither launches Messages nor sleeps behind them (a locked attempt fails in about 2 s with the lock reason).
+  `accessibility_why()` returns the kind alongside the reason; `accessibility()` is a wrapper, so exit codes
+  are unchanged (77 denied or locked, 69 Messages would not start). Four new tests. Verified on the
+  gateway Mac by the author: Messages quit, then a tapback cold-launched it and landed in 5.8 s. Deploy:
+  `bridge/mac/imsg-read` to the Mac.
+
+- **Pin works on a conversation far down the list (#132).** On macOS 27 Messages builds only the ~15
+  sidebar rows near the viewport, and opening a conversation through `open imessage:` does not scroll its row
+  into view, so for a chat 54th of 397 no row was selected and Pin stopped with "0 conversations are selected
+  in the sidebar". That was true on 27.0.1 as well as 27.2: #150's round trips used a chat already on screen.
+  `imsg-read` now pages the sidebar from the top with its own `AXScrollDownByPage` action until the selected
+  row is built, pins it, and pages the list back to the top. It still acts only on the row Messages reports
+  selected, never on a name match; a list with no selected row anywhere ends with the same error as before.
+  Verified on the 27.0.1 gateway with a DM 48th by recency: `--pin` exit 0 in 10 s and `--unpin` exit 0 in
+  14 s, the other app stayed in front, and the pin list was back to its original five in order. A new test
+  runs the real `SIDEBAR_JS` under bun against a sidebar that builds only nearby rows. Deploy:
+  `bridge/mac/imsg-read` to the Mac.
+
 - **A friend's shared city under their name (#152, thanks @mmdisbrow).** With `shared_city=on` in
   `bridge.conf` (off by default), an open direct conversation shows the city the friend shares with you
   through Find My, in place of their phone or email, in both the panel and the app. A location older than

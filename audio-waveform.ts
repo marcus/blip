@@ -1,7 +1,7 @@
 /** Pure presentation math shared by Bun and QML. Samples represent decoded
  * audio; unavailable audio uses an empty waveform, never decorative data. */
 export const AUDIO_WAVEFORM_BARS = 64;
-export const AUDIO_SAMPLE_RATE = 4000;
+export const AUDIO_SAMPLE_RATE = 24000;
 export const AUDIO_ANALYSIS_SECONDS = 600;
 
 export function normalizeWaveform(value: unknown): number[] {

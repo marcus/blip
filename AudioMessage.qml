@@ -1,12 +1,14 @@
 import QtQuick
 import QtQuick.Controls
-import QtMultimedia
 import "AudioWaveform.mjs" as AudioWaveform
 
 // One parent-owned playing intent selects the active voice message. Each
 // item retains its paused position; a conversation reset stops it entirely.
 Rectangle {
   id: root
+  property var playback: null
+  readonly property var player: playback || idle
+  QtObject { id: idle; property real position: 0; property real duration: 0; property bool seekable: false; property bool ready: false; property bool decodeFailed: false; property bool actuallyPlaying: false; function seek(ms) {} }
   property url source: ""
   property var waveform: []
   property real durationMs: 0
@@ -24,40 +26,22 @@ Rectangle {
   readonly property real positionMs: player.position
   readonly property real totalDurationMs: player.duration > 0 ? player.duration : durationMs
   readonly property real progress: AudioWaveform.playbackFraction(positionMs, totalDurationMs)
-  readonly property bool actuallyPlaying: player.playbackState === MediaPlayer.PlayingState
-  readonly property bool ready: player.mediaStatus === MediaPlayer.LoadedMedia || player.mediaStatus === MediaPlayer.BufferedMedia || player.mediaStatus === MediaPlayer.EndOfMedia
+  readonly property bool actuallyPlaying: player.actuallyPlaying
+  readonly property bool ready: player.ready
   readonly property bool seekable: player.seekable
-  readonly property bool decodeFailed: player.error !== MediaPlayer.NoError
+  readonly property bool decodeFailed: player.decodeFailed
   readonly property bool controlsFocused: playButton.activeFocus || timeline.activeFocus
   signal toggleRequested()
   signal playbackEnded()
   signal playbackFailed()
   signal contextRequested()
+  signal escapeRequested()
+  Keys.onEscapePressed: root.escapeRequested()
 
   implicitWidth: 268
   implicitHeight: 68
   radius: 18
   color: fillColor
-  onPlayingChanged: {
-    if (playing && String(source) !== "") {
-      if (player.mediaStatus === MediaPlayer.EndOfMedia) player.position = 0
-      player.play()
-    } else player.pause()
-  }
-  onResetTokenChanged: player.stop()
-  Component.onDestruction: player.stop()
-
-  MediaPlayer {
-    id: player
-    source: root.source
-    audioOutput: AudioOutput { muted: root.muted }
-    onMediaStatusChanged: {
-      if (mediaStatus === MediaPlayer.LoadedMedia && root.playing) play()
-      else if (mediaStatus === MediaPlayer.EndOfMedia) root.playbackEnded()
-    }
-    onErrorOccurred: root.playbackFailed()
-  }
-
   Item {
     id: playButton
     x: 10; y: (root.height - height) / 2
@@ -105,7 +89,7 @@ Rectangle {
     Accessible.name: "Audio message position"
     Accessible.description: (root.bars.length === 0 ? "Waveform unavailable. " : "")
       + AudioWaveform.durationLabel(root.positionMs) + " of " + AudioWaveform.durationLabel(root.totalDurationMs)
-    onMoved: player.position = Math.round(value)
+    onMoved: player.seek(Math.round(value))
     background: Item {
       x: timeline.leftPadding; y: timeline.topPadding
       width: timeline.availableWidth; height: timeline.availableHeight
@@ -146,8 +130,8 @@ Rectangle {
       visible: timeline.pressed || timeline.activeFocus
       color: root.textColor
     }
-    Keys.onLeftPressed: player.position = Math.max(0, player.position - 5000)
-    Keys.onRightPressed: player.position = Math.min(root.totalDurationMs, player.position + 5000)
+    Keys.onLeftPressed: player.seek(Math.max(0, player.position - 5000))
+    Keys.onRightPressed: player.seek(Math.min(root.totalDurationMs, player.position + 5000))
     Keys.onSpacePressed: root.toggleRequested()
     Keys.onReturnPressed: root.toggleRequested()
     Keys.onEnterPressed: root.toggleRequested()

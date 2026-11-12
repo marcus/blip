@@ -7,7 +7,7 @@
 #   1. ~/.config/blip/bridge.conf   host= (and remote_bin=, python=)
 #   2. ~/.ssh/config                 ControlMaster block for the host (47 ms warm
 #                                    round trips — Blip polls; this is required)
-#   3. ~/bin/{imsg,imsg-send,imsg-read,imsg-react,imsg-reply,contacts,contact-save}  the bridge shim (existing
+#   3. ~/bin/{imsg,imsg-send,imsg-read,imsg-react,contacts,contact-save}  the bridge shim (existing
 #                                    files backed up; claude-on-mac remote shims are left
 #                                    alone), plus ~/bin/blip-bridged, the persistent-channel
 #                                    daemon the bar widget runs. bin_dir= in bridge.conf, or
@@ -30,9 +30,17 @@ for dep in ssh scp bun jq notify-send wl-copy xdg-open; do
     [[ " ${pkgs[*]} " == *" ${pkg_for[$dep]} "* ]] || pkgs+=("${pkg_for[$dep]}")
   fi
 done
-# QML imports are runtime dependencies even before a voice message is played.
-# These are the standard Qt 6 locations on Arch and Debian/Ubuntu; no package
-# is installed by setup. WebP support is needed for animated sticker previews.
+webp_available=0
+for qt_root in /usr/lib/qt6 /usr/lib64/qt6 /usr/lib/x86_64-linux-gnu/qt6 /usr/lib/aarch64-linux-gnu/qt6; do
+  [[ -f "$qt_root/plugins/imageformats/libqwebp.so" ]] && webp_available=1
+ done
+IFS=: read -r -a qt_extra <<< "${QT_PLUGIN_PATH:-}"
+for qt_path in "${qt_extra[@]}"; do
+  [[ -f "$qt_path/imageformats/libqwebp.so" ]] && webp_available=1
+done
+if (( !webp_available )); then
+  echo "• optional, for animated stickers: sudo pacman -S --needed qt6-imageformats"
+fi
 qt6_has() {
   local qt_root
   for qt_root in /usr/lib/qt6 /usr/lib64/qt6 /usr/lib/x86_64-linux-gnu/qt6 /usr/lib/aarch64-linux-gnu/qt6; do
@@ -41,28 +49,27 @@ qt6_has() {
   return 1
 }
 if ! qt6_has qml/QtMultimedia/qmldir; then
-  missing+=("QtMultimedia QML module"); pkgs+=(qt6-multimedia)
+  echo "• optional inline audio: sudo pacman -S --needed qt6-multimedia"
 fi
 if ! qt6_has 'plugins/multimedia/*mediaplugin.so'; then
-  missing+=("QtMultimedia playback backend"); pkgs+=(qt6-multimedia-ffmpeg)
-fi
-if ! qt6_has plugins/imageformats/libqwebp.so; then
-  missing+=("Qt WebP image plugin"); pkgs+=(qt6-imageformats)
+  echo "• optional inline audio backend: sudo pacman -S --needed qt6-multimedia-ffmpeg"
 fi
 if (( ${#missing[@]} )); then
   echo "✗ missing on this machine: ${missing[*]}" >&2
   echo "  sudo pacman -S --needed ${pkgs[*]}   (Omarchy/Arch names), then re-run blip-setup" >&2
   exit 69
 fi
-echo "✓ Linux prerequisites present (bridge commands, Qt Multimedia, WebP)"
-# Optional media analysis: ffmpeg converts iPhone CAF voice notes to Ogg and
-# generates real waveforms/animated sticker previews; ffprobe validates audio.
-# Qt Multimedia plays inline. Missing codecs leave an unavailable preview
-# with Save still available; mpv is only an optional external file association.
+echo "✓ Linux prerequisites present (ssh scp bun jq notify-send wl-copy xdg-open)"
+# Optional analysis helpers: ffmpeg converts CAF and computes waveforms;
+# ffprobe verifies the audio stream. Qt Multimedia plays inline.
 optional=()
+optional_pkgs=()
 for dep in ffmpeg ffprobe; do command -v "$dep" >/dev/null 2>&1 || optional+=("$dep"); done
+if (( ${#optional[@]} )); then optional_pkgs+=(ffmpeg); fi
+if ! command -v mpv >/dev/null 2>&1; then optional+=(mpv); optional_pkgs+=(mpv); fi
 if (( ${#optional[@]} )); then
-  echo "• missing media helpers (${optional[*]}): sudo pacman -S --needed ffmpeg"
+  echo "• optional voice-message tools missing: ${optional[*]}"
+  echo "  sudo pacman -S --needed ${optional_pkgs[*]} (ffmpeg provides ffprobe)"
 fi
 
 # 0b. bun must be resolvable by the BAR, not just by this shell. Quickshell
@@ -143,7 +150,7 @@ kept=""
 [[ -r "$conf" ]] && kept="$(grep -vE '^[[:space:]]*(#|$|host=|remote_bin=|python=|key=|automation=|country_code=|bin_dir[[:space:]]*=)' "$conf" || true)"
 mkdir -p "$conf_dir"
 {
-  echo "# Blip bridge — read (never sourced) by the imsg, imsg-send, imsg-read, imsg-react, imsg-reply, contacts, contact-save shims"
+  echo "# Blip bridge — read (never sourced) by the imsg, imsg-send, imsg-read, imsg-react, contacts, contact-save shims"
   echo "host=$host"
   echo "# single-quoted on purpose: expanded on the MAC, not here"
   echo "remote_bin='\$HOME/.blip/bin'"

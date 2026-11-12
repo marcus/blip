@@ -115,6 +115,60 @@ class ReadTests(unittest.TestCase):
              patch.object(read, "osa", return_value=(1, broken)):
             self.assertEqual(read.accessibility(), broken)
 
+    RACE = ('System Events got an error: Can\'t get menu bar 1 of process "Messages". '
+            'Invalid index. (-1719)')
+
+    def test_a_launched_messages_is_waited_for_not_trusted(self):
+        # The launch race (2026-11-09): `open -g -j` puts the process on the
+        # list long before System Events can see its menu bar, and the old
+        # success condition — process exists — let the very next probe answer
+        # -1719. Every first tapback after Messages left lost that race.
+        seq = iter([(1, self.RACE),    # the gate: menus not registered yet
+                    (0, "false"),      # messages_running: not even a process
+                    (1, self.RACE),    # loop: process up, menus still absent
+                    (0, "Messages")])  # loop: driveable — success
+        with patch.object(read, "osa", side_effect=lambda *a: next(seq)), \
+             patch.object(read, "screen_locked", return_value=False), \
+             patch.object(read.subprocess, "run", return_value=CompletedProcess([], 0)) as run:
+            self.assertEqual(read.ensure_messages(), "")
+        self.assertIn(["open", "-g", "-j", "-a", "Messages"],
+                      [c[0][0] for c in run.call_args_list])
+
+    def test_menus_that_never_arrive_are_not_a_success(self):
+        def osa(script):
+            return (1, self.RACE) if "menu bar 1" in script else (0, "true")
+        with patch.object(read, "osa", side_effect=osa), \
+             patch.object(read, "screen_locked", return_value=False), \
+             patch.object(read.subprocess, "run", return_value=CompletedProcess([], 0)):
+            why = read.ensure_messages()
+        self.assertIn("cannot reach its menus", why)
+        self.assertIn("-1719", why)   # the tool's own error travels with it
+
+    def test_lock_and_denial_are_not_this_gate_and_never_wait(self):
+        # Waiting only helps the kind waiting can fix: a lock screen hides
+        # everything until a password, a denial repeats itself. Neither starts
+        # Messages, neither sleeps, and the reason stays with the gate that
+        # always named it — so exit 77 keeps its meaning and 69 stays
+        # "Messages would not start", exactly as before this fix.
+        with patch.object(read, "osa", return_value=(1, self.RACE)), \
+             patch.object(read, "screen_locked", return_value=True), \
+             patch.object(read.subprocess, "run") as run:
+            self.assertEqual(read.ensure_messages(), "")
+            self.assertIn("screen is locked", read.accessibility())
+        self.assertEqual(run.call_args_list, [])
+        with patch.object(read, "osa", return_value=(1, "osascript is not allowed assistive access")), \
+             patch.object(read.subprocess, "run") as run:
+            self.assertEqual(read.ensure_messages(), "")
+            self.assertIn("Accessibility is not granted", read.accessibility())
+        self.assertEqual(run.call_args_list, [])
+
+    def test_already_drivable_messages_answers_one_probe(self):
+        with patch.object(read, "osa", return_value=(0, "Messages")) as probe, \
+             patch.object(read.subprocess, "run") as run:
+            self.assertEqual(read.ensure_messages(), "")
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(run.call_args_list, [])
+
     def test_screen_lock_is_read_from_the_console_session(self):
         locked = plistlib.dumps({"IOConsoleUsers": [
             {"kCGSSessionUserNameKey": "me", "kCGSSessionOnConsoleKey": True, "CGSSessionScreenIsLocked": True}]})
@@ -290,7 +344,7 @@ class ConversationActions(unittest.TestCase):
 
     def run_action(self, flag, probe=WANT, unread=(0,), select_error="", clicks=((True, ""),),
                    front=("Previous app", "Messages"), handle=DM, start=OPPOSITE,
-                   sidebar=(True, "")):
+                   sidebar=(True, ""), refusal=""):
         """Run main() for one action. Returns (exit code, stdout, stderr, calls).
         `start` is what Hide/Show Alerts' pre-check reads (read.CHECK_FIRST)."""
         item, probe_name, want, _ = self.FLAGS[flag]
@@ -323,6 +377,10 @@ class ConversationActions(unittest.TestCase):
         def restore(prev):
             calls.append(f"restore:{prev}")
 
+        def refused():
+            calls.append("refusal")
+            return refusal
+
         def check(handle):
             if flag in read.CHECK_FIRST and not checked:
                 checked.append(True)
@@ -343,6 +401,7 @@ class ConversationActions(unittest.TestCase):
              patch.object(read, "sidebar_action", side_effect=side), \
              patch.object(read, "unread_on_mac", side_effect=count), \
              patch.object(read, "restore_front", side_effect=restore), \
+             patch.object(read, "pin_refusal", side_effect=refused), \
              patch.object(read, probe_name, side_effect=check), \
              patch.object(read.time, "sleep"), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -536,6 +595,150 @@ class ConversationActions(unittest.TestCase):
         self.assertNotIn("precheck", calls)
 
 
+    CAP = "You can pin up to 9 conversations. To pin this conversation, unpin another one first."
+
+    def test_a_pin_messages_refused_says_what_messages_said(self):
+        """Live on the 27.2 gateway (2026-11-09): the sidebar action returned
+        success, Messages put up its pin-limit alert, and the tool said only
+        "clicked but not pinned" and left the alert open."""
+        reason = f'Pin was clicked but Messages refused: "{self.CAP}" (the alert was dismissed)'
+        code, out, err, calls = self.run_action("--pin", probe=False, refusal=reason)
+        self.assertEqual(code, 75)
+        self.assertEqual(out, "")
+        self.assertIn(self.CAP, err)
+        self.assertNotIn("is not pinned", err)
+        self.assertEqual(calls[-2:], ["restore:Previous app", "refusal"])
+
+    def test_a_pin_that_failed_without_an_alert_keeps_the_old_message(self):
+        code, _, err, calls = self.run_action("--pin", probe=False, refusal="")
+        self.assertEqual(code, 75)
+        self.assertIn("was clicked but the conversation is not pinned", err)
+        self.assertIn("refusal", calls)
+
+    def test_the_window_is_only_read_after_a_pin_that_did_not_land(self):
+        for flag, kw in (("--pin", {}), ("--unpin", {"probe": True}), ("--mute", {"probe": False}),
+                         ("--unmute", {"probe": True})):
+            with self.subTest(flag=flag):
+                _, _, _, calls = self.run_action(flag, **kw)
+                self.assertNotIn("refusal", calls)
+
+    def test_an_unknown_pin_list_still_reads_the_alert(self):
+        code, _, err, _ = self.run_action("--pin", probe=None,
+                                          refusal=f'Pin was clicked but Messages refused: "{self.CAP}" (the alert was dismissed)')
+        self.assertEqual(code, 75)
+        self.assertIn(self.CAP, err)
+
+
+class PinRefusal(unittest.TestCase):
+    """pin_refusal() reads one line from the JXA helper; osascript is mocked."""
+
+    def refusal(self, stdout=b"", code=0, pid=4242, timeout=False):
+        done = subprocess.CompletedProcess([], code, stdout, b"")
+        effect = subprocess.TimeoutExpired("osascript", 1) if timeout else None
+        with patch.object(read, "messages_pid", return_value=pid), \
+             patch.object(read.subprocess, "run", return_value=done, side_effect=effect) as run:
+            got = read.pin_refusal()
+        return got, run
+
+    CAP = ConversationActions.CAP
+
+    def test_a_dismissed_pin_limit_alert_is_quoted_and_said_to_be_dismissed(self):
+        got, run = self.refusal(f"alert 1 {self.CAP}\n".encode())
+        self.assertIn(self.CAP, got)
+        self.assertIn("the alert was dismissed", got)
+        self.assertEqual(run.call_args[0][0][-1], "4242")
+
+    def test_an_alert_it_did_not_press_is_reported_as_left_open(self):
+        got, _ = self.refusal(b"alert 0 Delete this conversation? This cannot be undone.\n")
+        self.assertIn("Delete this conversation?", got)
+        self.assertIn("left open on the Mac", got)
+
+    def test_nothing_to_report_is_empty(self):
+        for stdout, code in ((b"none\n", 0), (b"", 0), (b"alert 1 \n", 0), (b"alert 1 ok", 1)):
+            with self.subTest(stdout=stdout, code=code):
+                self.assertEqual(self.refusal(stdout, code=code)[0], "")
+
+    def test_a_timeout_or_a_missing_messages_is_empty_and_never_runs_without_a_pid(self):
+        self.assertEqual(self.refusal(timeout=True)[0], "")
+        got, run = self.refusal(b"alert 1 x", pid=None)
+        self.assertEqual(got, "")
+        run.assert_not_called()
+
+    def test_control_characters_in_the_alert_text_do_not_reach_stderr(self):
+        got, _ = self.refusal("alert 1 limit\x1b[31m reached\r\x07".encode())
+        self.assertNotIn("\x1b", got)
+        self.assertNotIn("\x07", got)
+        self.assertNotIn("\r", got)
+
+
+FAKE_ALERT = r"""
+// An AX tree with one Messages window: app > window > [sheet > [texts, buttons]].
+const S = JSON.parse(process.argv[2]);
+const log = [];
+const arr = a => ({ count: String(a.length), objectAtIndex: i => a[i] });  // JXA counts are strings
+const mk = (role, extra) => Object.assign({ role, children: [] }, extra);
+const sheet = mk('AXSheet', { children: [
+  ...S.texts.map(t => mk('AXStaticText', { value: t })),
+  ...S.buttons.map(b => mk('AXButton', { title: b })) ] });
+const win = mk('AXWindow', { children: S.sheet ? [mk('AXGroup'), sheet] : [mk('AXGroup')] });
+const app = mk('AXApplication', { children: [win] });
+globalThis.ObjC = { import() {}, unwrap: x => x, castRefToObject: x => x };
+globalThis.Ref = () => [];
+globalThis.$ = Object.assign(s => s, {
+  AXUIElementCreateApplication: () => app,
+  AXUIElementCopyAttributeValue(el, name, ref) {
+    const v = name === 'AXChildren' ? arr(el.children) : name === 'AXRole' ? el.role
+      : name === 'AXValue' ? (el.value ?? null) : null;
+    if (v === null) return -25205;
+    ref[0] = v; return 0;
+  },
+  AXUIElementPerformAction(el, act) { log.push(act + ':' + el.title); return 0; },
+});
+"""
+
+
+class PinAlertJs(unittest.TestCase):
+    """The real PIN_ALERT_JS, run under bun or node against a fake AX tree."""
+
+    CAP = ConversationActions.CAP
+
+    def run_alert(self, texts, buttons, sheet=True):
+        import json, shutil
+        engine = shutil.which("bun") or shutil.which("node")
+        if not engine:
+            self.skipTest("no JavaScript runtime")
+        state = {"texts": texts, "buttons": buttons, "sheet": sheet}
+        js = FAKE_ALERT + read.PIN_ALERT_JS + (
+            "\nconst result = run(['4242']);\nconsole.log(JSON.stringify({result, log}));\n")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "alert.js"
+            path.write_text(js)
+            out = subprocess.run([engine, str(path), json.dumps(state)],
+                                 capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_the_pin_limit_sheet_is_read_and_its_only_button_pressed(self):
+        got = self.run_alert(["Pinned Conversations", self.CAP], ["OK"])
+        self.assertEqual(got["result"], "alert 1 Pinned Conversations " + self.CAP)
+        self.assertEqual(got["log"], ["AXPress:OK"])
+
+    def test_a_sheet_about_something_else_is_read_but_never_pressed(self):
+        got = self.run_alert(["Delete Conversation", "This cannot be undone."], ["OK"])
+        self.assertEqual(got["result"], "alert 0 Delete Conversation This cannot be undone.")
+        self.assertEqual(got["log"], [])
+
+    def test_a_sheet_with_a_choice_is_never_pressed_even_about_pins(self):
+        got = self.run_alert(["Unpin another conversation?"], ["Unpin", "Cancel"])
+        self.assertTrue(got["result"].startswith("alert 0 "))
+        self.assertEqual(got["log"], [])
+
+    def test_no_sheet_says_none(self):
+        got = self.run_alert([], [], sheet=False)
+        self.assertEqual(got["result"], "none")
+        self.assertEqual(got["log"], [])
+
+
 class SidebarAction(unittest.TestCase):
     """sidebar_action() reads one word from the JXA helper; osascript is mocked."""
 
@@ -608,6 +811,100 @@ class SidebarAction(unittest.TestCase):
         self.assertIn("'AXSelected') === true", js)
         self.assertIn("startsWith('Name:Pin ')", js)
         self.assertIn("endsWith(', Pinned')", js)
+
+
+FAKE_SIDEBAR = r"""
+// A Messages sidebar that, like the real one, builds only the rows near the
+// viewport: `window` rows from `top`, paged 10 at a time.
+const S = JSON.parse(process.argv[2]);
+const log = [];
+const rows = S.rows.map((d, i) => ({ desc: d, sel: i === S.selected,
+  acts: d.endsWith(', Pinned') ? ['Name:Unpin'] : ['AXPress', 'Name:Pin ' + d.split(',')[0]] }));
+let top = S.top;
+const arr = a => ({ count: String(a.length), objectAtIndex: i => a[i] });  // JXA counts are strings
+const list = { kind: 'list' };
+const app = { kind: 'app', children: [{ kind: 'window', children: [list] }] };
+function built() { return rows.slice(top, top + S.window); }
+function value(el, name) {
+  if (el.kind === 'app' || el.kind === 'window') return name === 'AXChildren' ? arr(el.children)
+    : name === 'AXRole' ? (el.kind === 'window' ? 'AXWindow' : 'AXApplication') : null;
+  if (el === list) return name === 'AXChildren' ? arr(built()) : name === 'AXDescription' ? 'Conversations' : null;
+  return name === 'AXSelected' ? el.sel : name === 'AXDescription' ? el.desc : null;
+}
+globalThis.ObjC = { import() {}, unwrap: x => x, castRefToObject: x => x };
+globalThis.Ref = () => [];
+globalThis.delay = () => {};
+globalThis.$ = Object.assign(s => s, {
+  AXUIElementCreateApplication: () => app,
+  AXUIElementCopyAttributeValue(el, name, ref) { const v = value(el, name); if (v === null) return -25205; ref[0] = v; return 0; },
+  AXUIElementCopyActionNames(el, ref) { ref[0] = arr(el.acts || []); return 0; },
+  AXUIElementPerformAction(el, act) {
+    if (el === list) {
+      log.push(act);
+      const last = Math.max(0, rows.length - S.window);
+      if (act === 'AXScrollDownByPage') top = Math.min(last, top + 10);
+      if (act === 'AXScrollUpByPage') top = Math.max(0, top - 10);
+    } else log.push('row:' + el.desc + ':' + act);
+    return 0;
+  },
+});
+"""
+
+
+class SidebarScroll(unittest.TestCase):
+    """The real SIDEBAR_JS, run under bun or node against a fake sidebar.
+    On macOS 27 `open imessage:` selects a far-down chat without bringing its
+    row into view (27.0.1 and 27.2, #132), so nothing built is selected."""
+
+    ROWS = [f"Friend {i}, hello" for i in range(60)]
+
+    def run_sidebar(self, want="Pin", selected=48, top=0, rows=None, window=12):
+        import json, shutil
+        engine = shutil.which("bun") or shutil.which("node")
+        if not engine:
+            self.skipTest("no JavaScript runtime")
+        state = {"rows": rows or self.ROWS, "selected": selected, "top": top, "window": window}
+        js = FAKE_SIDEBAR + read.SIDEBAR_JS + (
+            "\nconst result = run([" + json.dumps(want) + ", '4242']);"
+            "\nconsole.log(JSON.stringify({result, log, top}));\n")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "sidebar.js"
+            path.write_text(js)
+            out = subprocess.run([engine, str(path), json.dumps(state)],
+                                 capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_a_far_down_chat_is_paged_into_view_pinned_and_the_list_returns_to_the_top(self):
+        got = self.run_sidebar(selected=48)
+        self.assertEqual(got["result"], "done")
+        self.assertIn("row:Friend 48, hello:Name:Pin Friend 48", got["log"])
+        self.assertIn("AXScrollDownByPage", got["log"])
+        self.assertEqual(got["top"], 0)
+
+    def test_a_built_selected_row_never_scrolls(self):
+        got = self.run_sidebar(selected=3)
+        self.assertEqual(got["result"], "done")
+        self.assertFalse([a for a in got["log"] if a.startswith("AXScroll")])
+
+    def test_a_list_left_scrolled_down_is_searched_from_the_top(self):
+        got = self.run_sidebar(selected=2, top=40)
+        self.assertEqual(got["result"], "done")
+        self.assertIn("row:Friend 2, hello:Name:Pin Friend 2", got["log"])
+        self.assertEqual(got["top"], 0)
+
+    def test_nothing_selected_anywhere_ends_at_the_bottom_says_so_and_returns_to_the_top(self):
+        got = self.run_sidebar(selected=-1)
+        self.assertEqual(got["result"], "none 0 conversations are selected in the sidebar")
+        self.assertFalse([a for a in got["log"] if a.startswith("row:")])
+        self.assertEqual(got["top"], 0)
+
+    def test_a_pinned_tile_found_after_paging_is_already_pinned(self):
+        rows = list(self.ROWS)
+        rows[30] = "Friend 30, Pinned"
+        got = self.run_sidebar(selected=30, rows=rows)
+        self.assertEqual(got["result"], "already")
+        self.assertFalse([a for a in got["log"] if a.startswith("row:")])
 
 
 class ActionProbes(unittest.TestCase):

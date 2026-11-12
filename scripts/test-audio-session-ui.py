@@ -24,6 +24,12 @@ qml = '''import QtQuick
 import QtTest
 Item {
   id: root
+  property QtObject externalAudio: QtObject { property bool running: false; property var command: [] }
+  property var audioPlayback: ({status: Loader.Ready})
+  property int rowBudget: 1
+  property int rowBatch: 1
+  function retryBareAvatars() {}
+  @SURFACE@
   property bool surfaceOpen: true
   property bool inThread: true
   property var active: ({chat:"synthetic-a"})
@@ -43,7 +49,7 @@ Item {
   TestCase {
     name: "AudioSession"
     function init() {
-      root.stopAudio(); root.requests = []; root.note = ""; root.fetchingId = ""; root.fetchJobAction = ""; root.attFiles = ({}); root.attMetrics = ({});
+      root.audioPlayback = ({status: Loader.Ready}); root.stopAudio(); root.requests = []; root.note = ""; root.fetchingId = ""; root.fetchJobAction = ""; root.attFiles = ({}); root.attMetrics = ({});
       root.surfaceOpen = true; root.inThread = true; root.active = ({chat:"synthetic-a"});
     }
     function complete(id, ok) {
@@ -61,7 +67,7 @@ Item {
       verify(!root.audioPlaying); compare(root.playingAudio,""); compare(root.pendingAudioId,"");
     }
     function test_closing_during_fetch_never_plays() {
-      root.toggleAudio({id:"a"}); root.surfaceOpen=false; root.stopAudio(); complete("a",true);
+      root.toggleAudio({id:"a"}); root.surfaceOpen=false; complete("a",true);
       verify(!root.audioPlaying); compare(root.pendingAudioChat,"");
     }
     function test_other_attachment_completion_does_not_consume_intent() {
@@ -99,12 +105,26 @@ Item {
       root.attMetrics=({a:{audio:{playable:false}}}); root.settleAudioFetch("a",true);
       verify(!root.audioPlaying); compare(root.playingAudio,"");
     }
+    function test_mixed_case_audio_and_missing_multimedia_fallback() {
+      root.openAttachment({id:"a",mime:"Audio/WAV"});
+      compare(root.requests[0].action,"audio-play");
+      root.requests=[]; root.audioPlayback=({status:Loader.Error});
+      root.openAttachment({id:"b",mime:"Audio/WAV"});
+      compare(root.requests[0].action,"open");
+    }
+    function test_external_fallback_stops_on_surface_close() {
+      root.toggleAudio({id:"a"}); root.attFiles=({a:"file:///synthetic/voice.ogg"});
+      root.attMetrics=({a:{audio:{playable:false,externalDemuxer:"ogg"}}});
+      root.settleAudioFetch("a",true);
+      verify(externalAudio.running); verify(externalAudio.command.indexOf("--") >= 0);
+      root.surfaceOpen=false; verify(!externalAudio.running);
+    }
     function test_missing_id_or_closed_surface_cannot_request_play() {
       root.toggleAudio({id:""}); root.surfaceOpen=false; root.toggleAudio({id:"a"}); compare(root.requests.length,0);
     }
   }
 }
-'''.replace('@FUNCTIONS@', '\n'.join(function(name) for name in ['toggleAudio','settleAudioFetch','failAudio','stopAudio']))
+'''.replace('@SURFACE@', source[source.index('  onSurfaceOpenChanged: {'):source.index('  function pumpAvatar()', source.index('  onSurfaceOpenChanged: {'))]).replace('@FUNCTIONS@', '\n'.join(function(name) for name in ['toggleAudio','settleAudioFetch','failAudio','stopAudio','openAttachment','playExternalAudio']))
 runner = shutil.which('qmltestrunner') or '/usr/lib/qt6/bin/qmltestrunner'
 with tempfile.TemporaryDirectory(prefix='blip-audio-session-') as tmp:
     path=Path(tmp); (path/'tst_audio.qml').write_text(qml)

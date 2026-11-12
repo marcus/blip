@@ -1118,9 +1118,33 @@ def _edit_flags(date_edited, date_retracted, summary_info) -> dict:
     return {"edited": True} if date_edited else {}
 
 
-def enrich(con, rows, with_names: bool):
+# A reaction is sent after the message it reacts to, so the reactions to a
+# window of messages are searched for from the window's oldest message onward,
+# not through every message ever received: that scan was 93 ms of a 100 ms
+# conversation load on a 282,650-message chat.db, and `message_idx_date` brings
+# it to 2 ms. The margin exists because clocks disagree: on the real database 3
+# of 28,305 reactions are stamped BEFORE their target, the worst by 0.83 days.
+# 90 days is 100 times that. Anything the bound cannot vouch for (no usable
+# date in the window) takes the unbounded query, which is also the test oracle.
+# The rows are sorted by ROWID in Python: that is the order the old table scan
+# returned them in, while the date index returns date order and would reorder the
+# reactions shown on a message. (An ORDER BY in SQL makes the planner prefer the
+# full scan again, which is what the plan test guards.)
+TAPBACK_SKEW_NS = 90 * 86400 * 10**9
+
+
+def _tapback_floor(rows, skew_ns=TAPBACK_SKEW_NS):
+    """Oldest Apple-ns stamp a reaction to any of `rows` can carry, or None."""
+    if skew_ns is None:
+        return None
+    dates = [d for d in (_row_value(r, "date") for r in rows) if isinstance(d, int) and not isinstance(d, bool) and d > 0]
+    return min(dates) - skew_ns if dates else None
+
+
+def enrich(con, rows, with_names: bool, skew_ns=TAPBACK_SKEW_NS):
     """Per-ROWID extras for --rich JSON. Returns (kept_rows, extras) where
-    tapback rows are folded onto their targets and dropped from kept_rows."""
+    tapback rows are folded onto their targets and dropped from kept_rows.
+    `skew_ns=None` reads every reaction in the database (the old behaviour)."""
     rows = list(rows)
     has_emoji = _has_col(con, "associated_message_emoji")
     has_edit = _has_col(con, "date_edited")
@@ -1135,15 +1159,19 @@ def enrich(con, rows, with_names: bool):
     orphan_targets = {_strip_assoc(_row_value(r, "assoc_guid")) for r in orphans.values()}
     legacy_stickers = []
 
-    # Tapbacks: scan every assoc row in the DB (type-filtered), net per sender+target.
+    # Tapbacks: every assoc row from the window's oldest message onward
+    # (type-filtered), net per sender+target. See TAPBACK_SKEW_NS.
     emoji_col = ", m.associated_message_emoji AS emo" if has_emoji else ""
+    floor = _tapback_floor(rows, skew_ns)
     latest: dict[tuple[str, str, int], sqlite3.Row] = {}
-    for r in con.execute(
+    for r in sorted(con.execute(
         f"""SELECT m.ROWID AS mid, m.guid, m.associated_message_guid AS ag, m.associated_message_type AS t,
                    m.is_from_me, m.date, h.id AS handle{emoji_col}
             FROM {MESSAGE_SRC} m LEFT JOIN handle h ON h.ROWID = m.handle_id
-            WHERE m.associated_message_type = 1000 OR m.associated_message_type BETWEEN 2000 AND 3999"""
-    ):
+            WHERE {"m.date >= ? AND " if floor is not None else ""}(m.associated_message_type = 1000
+                  OR m.associated_message_type BETWEEN 2000 AND 3999)""",
+        () if floor is None else (floor,),
+    ), key=lambda r: _row_value(r, "mid", 0)):
         tg = _strip_assoc(r["ag"])
         if tg not in targets and tg not in orphan_targets:
             continue
@@ -1328,8 +1356,6 @@ def enrich(con, rows, with_names: bool):
         e = extras[r["ROWID"]]
         if r["is_from_me"] and r["date_read"]:
             e["read_at"] = fmt_ts(r["date_read"])
-        # Messages only says "Delivered" for messages it can track to the device;
-        # a carrier SMS has no such state even when its flag happens to be set.
         if r["is_from_me"] and r["is_delivered"] and r["service"] in ("iMessage", "RCS"):
             e["delivered"] = True
         if has_edit:
@@ -1847,17 +1873,34 @@ def cmd_chats(con, args):
             selected.append(r)
 
         latest = {}
-        for r in selected:
-            last = con.execute(
-                f"""SELECT m.ROWID AS mid, m.text, m.attributedBody, m.is_from_me, h.id AS handle,
+        # The newest visible message of each conversation. Ordering by an expression
+        # (pending first) forces a scan of the WHOLE chat for every one of the ~300
+        # rows: 140 ms of the 750 this call cost on the gateway. With the join index
+        # (chat_id, message_date, message_id) the newest non-pending row is the first
+        # one the walk meets. A NULL schedule is NOT pending (it sorted first before),
+        # hence IS NOT 1. A chat with nothing but waiting Send Later rows has no such
+        # row and falls through to the original query.
+        latest_cols = """m.ROWID AS mid, m.text, m.attributedBody, m.is_from_me, h.id AS handle,
                            m.balloon_bundle_id, m.payload_data
                     FROM chat_message_join cmj
-                    JOIN {MESSAGE_SRC} m ON m.ROWID = cmj.message_id
+                    JOIN {src} m ON m.ROWID = cmj.message_id
                     LEFT JOIN handle h ON h.ROWID = m.handle_id
-                    WHERE cmj.chat_id = ?
-                    ORDER BY {pending} ASC, m.date DESC LIMIT 1""",
-                (r["cid"],),
-            ).fetchone()
+                    WHERE cmj.chat_id = ?"""
+        by_join_index = "message_date" in {c[1] for c in con.execute("PRAGMA table_info(chat_message_join)")}
+        for r in selected:
+            last = None
+            if by_join_index:
+                last = con.execute(
+                    "SELECT " + latest_cols.format(src=MESSAGE_SRC) +
+                    f" AND {pending} IS NOT 1 ORDER BY cmj.message_date DESC, cmj.message_id DESC LIMIT 1",
+                    (r["cid"],),
+                ).fetchone()
+            if last is None:
+                last = con.execute(
+                    "SELECT " + latest_cols.format(src=MESSAGE_SRC) +
+                    f" ORDER BY {pending} ASC, m.date DESC LIMIT 1",
+                    (r["cid"],),
+                ).fetchone()
             if last:
                 latest[r["cid"]] = last
 
@@ -2682,6 +2725,29 @@ def cmd_read_state(con, args):
     print(json.dumps({"version": 1, "chats": rows}))
 
 
+def gui_session_alive():
+    """True when this user has a graphical login session on the Mac, False when not, None when
+    it could not be told.
+
+    A send goes through Messages, and Launch Services can start an app only inside a GUI session.
+    After a logout (the 10 Nov WindowServer crash left the gateway at the login window; FileVault
+    means only the owner can log back in) every send fails with -10810 while reads, which are
+    plain sqlite over ssh, keep working. launchd's own answer is exact and free: the `gui/<uid>`
+    domain exists while someone is logged in at the screen and is gone when they are not (rc 0
+    versus rc 112, "Could not find domain"). It touches no app, so it asks for no permission."""
+    try:
+        r = subprocess.run(["/bin/launchctl", "print", f"gui/{os.getuid()}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.returncode == 0
+
+
+def cmd_session(con, args):
+    """One JSON line: is anyone logged in at the Mac's screen (see gui_session_alive)."""
+    print(json.dumps({"version": 1, "gui": gui_session_alive()}))
+
+
 def cmd_watch(con, args):
     """Block forever, emitting one line whenever chat.db changes — a push
     channel for remote clients (Blip) that otherwise poll.
@@ -2843,7 +2909,7 @@ def cmd_analyze(con, args):
 # attachment/avatar stream binary and would park the channel behind a 100 MB
 # photo; watch blocks forever by design; serve would recurse. Those keep the
 # one-shot path, which still works and is what everything falls back to.
-SERVE_ALLOWED = {"recent", "from", "thread", "search", "contacts", "chats", "groups", "analyze"}
+SERVE_ALLOWED = {"recent", "from", "thread", "search", "contacts", "chats", "groups", "analyze", "read-state", "session"}
 
 
 def cmd_serve(con, args) -> None:
@@ -3013,6 +3079,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_avatar)
     s = sub.add_parser("read-state", parents=[common], help="complete metadata-only unread snapshot")
     s.set_defaults(func=cmd_read_state)
+    s = sub.add_parser("session", parents=[common], help="is anyone logged in at the Mac's screen (sends need it)")
+    s.set_defaults(func=cmd_session)
     s = sub.add_parser("watch", parents=[common],
                        help="emit a line whenever chat.db changes (push channel)")
     s.set_defaults(func=cmd_watch)

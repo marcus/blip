@@ -46,6 +46,7 @@ jobs:
           python3 scripts/test-conversation-menu-ui.py
           python3 scripts/test-time-reveal-ui.py
           python3 scripts/test-notice-ui.py
+          python3 scripts/test-audio-loader.py
       - name: OTP desktop adapter (no desktop needed)
         run: |
           python3 -m py_compile otp-desktop.py
@@ -58,6 +59,8 @@ jobs:
         run: python3 bridge/mac/test_read_verification.py
       - name: read state and action verification (synthetic SQLite, no macOS needed)
         run: python3 bridge/mac/test_read_sync.py
+      - name: reactions are read from the window's oldest message onward, exactly as before (synthetic SQLite, no macOS needed)
+        run: python3 bridge/mac/test_tapback_window.py
       - name: group-photo lookup (no macOS needed)
         run: python3 bridge/mac/test_group_photo.py
       - name: phone matching, the way Contacts does it (no macOS needed)
@@ -79,8 +82,10 @@ jobs:
       - name: read pushes address groups and restore focus (no macOS needed)
         run: python3 bridge/mac/test_read.py
       - name: tapbacks are verified by chat.db, pressed once and never mid-scroll (no macOS needed)
-        run: python3 bridge/mac/test_react.py
-      - name: native replies refuse what is unproven and are confirmed by chat.db (no macOS needed)
+        run: |
+          python3 bridge/mac/test_react.py
+          python3 bridge/mac/test_reaction_kind.py
+      - name: native replies (synthetic)
         run: python3 bridge/mac/test_reply.py
       - name: hide Spam / unknown senders (no macOS needed)
         run: python3 bridge/mac/test_filtered.py

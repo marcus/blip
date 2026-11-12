@@ -1,6 +1,6 @@
 // audio-waveform.ts
 var AUDIO_WAVEFORM_BARS = 64;
-var AUDIO_SAMPLE_RATE = 4000;
+var AUDIO_SAMPLE_RATE = 24000;
 var AUDIO_ANALYSIS_SECONDS = 600;
 function normalizeWaveform(value) {
   if (!Array.isArray(value) || value.length > 96)

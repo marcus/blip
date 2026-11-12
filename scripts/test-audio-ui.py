@@ -40,7 +40,7 @@ def main():
         metadata = json.loads(result.stdout)
         assert not metadata["unavailable"] and metadata["durationMs"] == 4000
         assert len(metadata["waveform"]) == 64 and max(metadata["waveform"]) == 1
-        for file in ["AudioMessage.qml", "AudioWaveform.mjs"]:
+        for file in ["AudioMessage.qml", "AudioPlayback.qml", "AudioWaveform.mjs"]:
             shutil.copy(ROOT / file, folder)
         capture = "" if args.capture is None else str(args.capture.resolve())
         if capture:
@@ -52,14 +52,20 @@ Item {
   width: 350; height: 190
   property int ended: 0
   property int failures: 0
+  property var rows: [1]
+  Repeater { model: root.rows; delegate: AudioMessage { playback: engine; visible: false } }
   Rectangle { anchors.fill: parent; color: "#202127" }
+  AudioPlayback {
+    id: engine
+    source: @PLAYBACK@; muted: true; playing: card.playing; resetToken: card.resetToken
+    onPlaybackEnded: { root.ended++; card.playing = false }
+    onPlaybackFailed: root.failures++
+  }
   AudioMessage {
-    id: card; x: 30; y: 28; width: 288
+    id: card; playback: engine; x: 30; y: 28; width: 288
     source: "voice.wav"; muted: true
     waveform: @WAVEFORM@; durationMs: 4000
     onToggleRequested: playing = !playing
-    onPlaybackEnded: { root.ended++; playing = false }
-    onPlaybackFailed: root.failures++
   }
   AudioMessage {
     x: 90; y: 112; width: 230; mine: true; muted: true
@@ -111,7 +117,18 @@ Item {
       card.resetToken++
       compare(root.failures, 0)
     }
-    function test_04_compact_layout_and_unavailable_waveform() {
+    function test_04_delegate_rebuild_preserves_playback() {
+      card.playing = true
+      tryVerify(function() { return engine.position > 100 }, 3000)
+      var before = engine.position
+      root.rows = [2, 3]
+      tryVerify(function() { return engine.position > before + 100 }, 3000)
+      card.playing = false
+      var slider = findChild(card, "audioTimeline")
+      slider.forceActiveFocus()
+      keyClick(Qt.Key_Escape)
+    }
+    function test_05_compact_layout_and_unavailable_waveform() {
       card.width = 160
       verify(card.bars.length <= 20)
       card.waveform = []
@@ -128,7 +145,7 @@ Item {
     }
   }
 }
-'''.replace("@WAVEFORM@", json.dumps(metadata["waveform"])).replace("@CAPTURE@", json.dumps(capture)))
+'''.replace("@PLAYBACK@", json.dumps(metadata["playbackUrl"])).replace("@WAVEFORM@", json.dumps(metadata["waveform"])).replace("@CAPTURE@", json.dumps(capture)))
         return subprocess.run([runner, "-input", str(folder), "-platform", "offscreen"], timeout=30,
             env={**os.environ, "QT_QPA_PLATFORM":"offscreen", "QT_QPA_PLATFORMTHEME":"generic",
                  "QT_QUICK_BACKEND":"software", "QT_MEDIA_BACKEND":"ffmpeg"}).returncode
