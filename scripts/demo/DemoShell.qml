@@ -32,6 +32,9 @@ ShellRoot {
     property var avatarCache: ({})
     property string binDir: Quickshell.env("HOME") + "/bin"
     property var pendingSends: []
+    property var replyPending: []
+    signal replyExited(var job, int code, string reason)
+    function reconcileReplies(chat, pending) { }
     property int sendEpoch: 0
     property bool tapbacks: true
     signal tapbackExited(string chat, bool ok)

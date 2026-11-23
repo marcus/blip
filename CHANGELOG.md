@@ -45,6 +45,38 @@
 
 ## Unreleased
 
+- Blip closes Find My after a shared-city lookup when it opened the app for that lookup.
+- **A send now follows what the conversation's own messages say, not the Mac's chat label (#165, Jason Alexander).** A
+  contact texting you on RCS while their chat row was still labelled iMessage got every send as iMessage, failing with
+  error 22. The send now reads the service from the opened conversation's recent rows (most recent delivered proof wins;
+  a failed iMessage does not count), and only a phone number or short code ever carries SMS, so a merged phone + email
+  conversation can no longer hand an email address SMS; a group still sends by chat id with no service. Review found the
+  email-address case and five should-fix items, all closed over two rounds; rebased onto #160 by me, `SendState.mjs`
+  regenerated. Not yet proven on a real Android contact through the Mac's RCS service.
+- **A failed Mark All as Read is retried per conversation without losing newer messages (#167, Curtis Chambers), under `push_read=thread`.**
+  A bulk mark-all that failed or was interrupted (a locked Mac, a dropped link) used to be forgotten, or worse repeated
+  as an unbounded `--all`. The attempt is now saved before the bridge runs and, once a snapshot shows what the click
+  covered, becomes bounded per-chat reads (`--through` the newest message you had seen), so a message that arrived after
+  the click stays unread. Found on a real locked gateway (#166). My review caught that the expansion also ran under the
+  default `push_read=all`, where it would have opened Messages on the Mac once per unread conversation; it is now gated
+  to `thread`, with a test that fails without the gate. Still open from review, not blocking: the leftover marker for
+  business threads keeps the old error on screen, and a message stamped ahead of the Linux clock can come back unread.
+- **Mark All as Read works with Messages minimized or closed (#164, Jared Moody).** On macOS 27.2 the Mark All as Read
+  menu item stays disabled while Messages has no window on screen, however long it is the active app, so every push exited
+  75 ("stayed disabled even after waking Messages"): 20 in a row from 20 Oct to 11 Nov on his gateway, hidden because
+  Blip's local read state covered it. `imsg-read` now looks at the window first (read-only), restores a minimized one or
+  asks Messages to reopen when there is none, clicks, and minimizes it again; an unreadable state changes nothing, and the
+  window goes back even if the click fails. `imsg-read --status` names the window as the reason when the menu is dormant.
+  Proven on the gateway with the tool's own functions (minimized, restored, visible), nothing marked read.
+- **Native replies (#160, Marcus Vorwaller), opt-in.** `replies=on` in bridge.conf lets you reply to a specific message
+  in a direct conversation (text or a single picture) and have Messages thread it, through a new Mac tool, `imsg-reply`.
+  Off by default, and refused by the shim, the dispatcher and the installer unless on. Every check runs before the single
+  Return: no draft already on the Mac, the window title matches the recipient, the reply view names the target, the
+  focused field holds your exact text, Messages is in front. Afterwards chat.db must show your row; anything unconfirmed
+  says "Check Messages before sending again" and never hands your words back or resends (a helper killed by a signal
+  counts as unconfirmed). Identical messages in the same minute are refused. My review reproduced an undefined name that
+  broke tapbacks, a hand-back after a possible send, and untested guards; all fixed over four rounds. Not yet proven live
+  on a macOS 27.2 gateway: the window-title shape and the field fill need one real send in your own thread.
 - **Shared city works on a macOS 27.2 gateway (#152 follow-up).** Find My on 27.2 writes a People row as plain text with
   commas ("Name, 1 mi, Boston, MA · Now") where 27.0 and 27.1 used a button with dots, so the reader found no rows and
   every header kept the phone number. It now reads both layouts and rewrites the new one to the old shape before any

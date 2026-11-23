@@ -4,10 +4,33 @@ function markSendFailed(items, id, reason, fallback) {
   const current = fallback && !items.some((item) => item.localId === id) ? items.concat([fallback]) : items;
   return current.map((item) => item.localId === id ? Object.assign({}, item, { failed: true, failureReason: safeReason }) : item);
 }
+function sendServiceArg(chat, group, listService, loadedChat, loadedService) {
+  if (group)
+    return "";
+  const svc = (loadedChat === chat && loadedService !== "" ? loadedService : listService).toUpperCase();
+  if (svc === "RCS")
+    return svc;
+  return svc === "SMS" && /^\+?[0-9]{3,15}$/.test(chat) ? svc : "";
+}
 function friendlySendError(raw) {
   return /(^|[^\d])-10810(\D|$)/.test(raw) ? "Messages can't start on the Mac: nobody is logged in there. Log in on the Mac, then send again." : raw;
 }
+var REPLY_NOT_STARTED = -2;
+function replyExitCode(code, status) {
+  return status === 0 ? code : 76;
+}
+function replyFailure(code, detail) {
+  return !replyCanRestore(code) ? "Check Messages before sending again" : detail.trim().slice(0, 240) || "Reply was not sent";
+}
+function replyCanRestore(code) {
+  return [REPLY_NOT_STARTED, 1, 64, 65, 75, 77, 78].includes(code);
+}
 export {
+  REPLY_NOT_STARTED,
   friendlySendError,
-  markSendFailed
+  markSendFailed,
+  replyCanRestore,
+  replyExitCode,
+  replyFailure,
+  sendServiceArg
 };

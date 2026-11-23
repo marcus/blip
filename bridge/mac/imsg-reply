@@ -113,6 +113,12 @@ function composer() {
   }
   return null;
 }
+function identity(q) {
+  const w = safe(() => proc.windows[0], null);
+  if (!w || safe(() => w.sheets.length, 1) !== 0) return false;
+  const title = norm(safe(() => w.name(), ""));
+  return (q.chatNames || []).some(n => norm(n) === title);
+}
 function send(q) {
   let el = null, i = null;
   for (let n = 0; n < q.polls; n++) {
@@ -124,19 +130,20 @@ function send(q) {
   if (!i) return { ok: false, error: "no-reply-view" };
   if (!front()) return { ok: false, error: "not-front" };
   if (i.length > 0) return { ok: false, error: "draft" };
+  if (!identity(q)) return { ok: false, error: "wrong-conversation" };
   if (!viewNames(q)) return { ok: false, error: "reply-elsewhere" };
   try { el.value = q.body; } catch (e) { return { ok: false, error: "fill-failed" }; }
   delay(0.3);
   if (String(safe(() => el.value(), "")) !== q.body) { safe(() => { el.value = ""; }); return { ok: false, error: "fill-failed" }; }
   const now = info(focused());
-  if (!front() || now.id !== "messageBodyField" || now.placeholder !== "Reply") {
+  if (!identity(q) || !viewNames(q) || !front() || now.id !== "messageBodyField" || now.placeholder !== "Reply" || String(safe(() => focused().value(), "")) !== q.body) {
     safe(() => { el.value = ""; });
     return { ok: false, error: "focus-moved" };
   }
   se.keyCode(36);
   delay(0.8);
   const left = info(focused());
-  if (left.length > 0) { safe(() => { focused().value = ""; }); return { ok: false, error: "not-sent" }; }
+  if (left.length > 0) return { ok: false, error: "unconfirmed" };
   return { ok: true };
 }
 function run() {
@@ -204,6 +211,8 @@ def resolve_picture(con, imsg, row, self_handles: list) -> dict:
     refuses whenever that does not pick out one bubble."""
     if rx.norm(imsg.message_text(row)):
         raise Stop("unsupported", EX_UNSUPPORTED, "replying to a picture with a caption is not supported yet")
+    if row["style"] == 43:
+        raise Stop("unsupported", EX_UNSUPPORTED, "groups are not supported")
     files = _attachments(con, row["ROWID"])
     if len(files) != 1:
         raise Stop("unsupported", EX_UNSUPPORTED, "replying to a message with several attachments is not supported yet")
@@ -216,9 +225,12 @@ def resolve_picture(con, imsg, row, self_handles: list) -> dict:
     from_me = bool(row["is_from_me"])
     date, rowid = row["date"], row["ROWID"]
     self_thread = row["chat_identifier"] in self_handles
+    def picture(r):
+        files = _attachments(con, r["ROWID"])
+        return not rx.norm(imsg.message_text(r)) and len(files) == 1 and not files[0]["sticker"] and str(files[0]["mime_type"] or "").lower().startswith("image/")
     if self_thread:
         twins = [t for t in rx.bubbles(con, chats, "m.cache_has_attachments AND ABS(m.date - ?) < ?",
-                                       "m.is_from_me DESC, m.date, m.ROWID", (date, rx.SELF_TWIN_NS))]
+                                       "m.is_from_me DESC, m.date, m.ROWID", (date, rx.SELF_TWIN_NS)) if picture(t)]
         guids = list(dict.fromkeys([row["guid"]] + [t["guid"] for t in twins]))
         sent = next((t for t in twins if t["is_from_me"]), None)
         if sent:
@@ -228,7 +240,7 @@ def resolve_picture(con, imsg, row, self_handles: list) -> dict:
     ordinal = scanned = 0
     for r in rx.bubbles(con, chats, "m.is_from_me = ? AND m.cache_has_attachments", f"m.date, m.ROWID LIMIT {rx.LATER_SCAN}", (int(from_me),)):
         scanned += 1
-        if r["guid"] in guids or rx.hhmm(r["date"]) != minute or rx.norm(imsg.message_text(r)):
+        if r["guid"] in guids or rx.hhmm(r["date"]) != minute or not picture(r):
             continue
         if abs(r["date"] - date) < day:
             raise Stop("ambiguous", EX_TEMPFAIL, "two pictures were sent in that minute and Messages labels them alike; nothing was sent")
@@ -262,8 +274,13 @@ def resolve(con, imsg, guid: str, self_handles: list) -> dict:
     if row["balloon_bundle_id"]:
         raise Stop("unsupported", EX_UNSUPPORTED, "replying to a link or app card is not supported yet")
     if row["cache_has_attachments"]:
-        return resolve_picture(con, imsg, row, self_handles)
-    return rx.resolve(con, imsg, guid, self_handles)
+        target = resolve_picture(con, imsg, row, self_handles)
+    else:
+        target = rx.resolve(con, imsg, guid, self_handles)
+    # The reply transcript cannot verify which identical label was selected.
+    if target["ordinal"] > 0:
+        raise Stop("ambiguous", EX_TEMPFAIL, "another message has the same text and time label; nothing was sent")
+    return target
 
 
 def threads(con, target: dict) -> set:
@@ -301,6 +318,15 @@ def confirm(con, imsg, expected: set, text: str, since: int, pause=time.sleep) -
                "the reply was submitted but Messages did not record it yet; check before sending it again")
 
 
+def confirm_safely(*args):
+    try:
+        return confirm(*args)
+    except Stop:
+        raise
+    except Exception:
+        raise Stop("unconfirmed", EX_UNCONFIRMED, "Return may have been pressed; check Messages before sending again")
+
+
 NOT_SENT = {
     "draft": "this chat has a draft in Messages on the Mac; send or clear it first. Nothing was sent",
     "no-reply-view": "the reply view did not open; nothing was sent",
@@ -308,7 +334,7 @@ NOT_SENT = {
     "reply-elsewhere": "the reply view opened on a different message; nothing was sent",
     "fill-failed": "the reply could not be filled in; nothing was sent",
     "focus-moved": "focus moved away from the reply; nothing was sent",
-    "not-sent": "Messages did not accept the reply; nothing was sent",
+    "wrong-conversation": "Messages did not verify the recipient; nothing was sent",
 }
 
 
@@ -349,21 +375,30 @@ def reply(con, imsg, target: dict, text: str, ui, run=jxa, perform=None, pause=t
                 raise Stop(pressed["error"], EX_TEMPFAIL, "Messages could not find that message on screen; nothing was sent")
             raise rx.failure(pressed, REPLY_ACTION)
         opened = True
-        sent = run({"mode": "send", "body": text, "text": target["text"], "hhmm": target["hhmm"], "polls": OPEN_POLLS})
+        chat_names = [target["chat"]]
+        name = imsg.name_for(target["chat"]) if hasattr(imsg, "name_for") else None
+        if name: chat_names.append(name)
+        try:
+            sent = run({"chatNames": chat_names, "mode": "send", "body": text, "text": target["text"], "hhmm": target["hhmm"], "polls": OPEN_POLLS})
+        except Exception:
+            return confirm_safely(con, imsg, expected, text, since, pause)
         if not sent.get("ok"):
             code = sent.get("error", "error")
-            if code in rx.MAYBE_PERFORMED:
+            if code not in NOT_SENT:
                 # osascript died or timed out, possibly after Return. Never resend.
-                return confirm(con, imsg, expected, text, since, pause)
+                return confirm_safely(con, imsg, expected, text, since, pause)
             raise Stop(code, EX_TEMPFAIL, NOT_SENT.get(code, "the reply could not be sent; nothing was sent"))
-        result = confirm(con, imsg, expected, text, since, pause)
+        result = confirm_safely(con, imsg, expected, text, since, pause)
         result["seconds"] = round(time.monotonic() - started, 1)
         return result
     finally:
-        if opened:
-            run({"mode": "close"})
-            pause(0.4)
-        ui.restore_front(prev)
+        try:
+            if opened:
+                run({"mode": "close"})
+                pause(0.4)
+            ui.restore_front(prev)
+        except Exception:
+            pass  # Cleanup cannot change a confirmed or uncertain send outcome.
 
 
 def log_outcome(code: str, exit_code: int, seconds=None) -> None:

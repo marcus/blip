@@ -526,7 +526,6 @@ FocusScope {
   // Text sends queue instead of refusing while one is on the wire; each gets
   // its bubble the instant Enter is pressed (see pendingSends).
   property var sendQueue: []
-  property var sendReply: null
   // Files still to ship for the send in flight: one part per file, in order.
   // The caption rides the FIRST part only — repeating it on each would post
   // the same sentence five times.
@@ -536,6 +535,26 @@ FocusScope {
   // root.active can change under a multi-part send, and a later part must not
   // go out on a different service from the first (war room #2).
   property string sendService: ""
+  // What the open conversation's own rows say to send on (thread.ts `service`)
+  // and the chat they were loaded for. SendState.sendServiceArg prefers it over
+  // the list row's service, which is the Mac's chat label and goes stale when a
+  // contact moves to Android.
+  property string threadSendService: ""
+  property string threadSendServiceChat: ""
+
+  /** Keep thread.ts's `service` with the chat it was loaded for. It is "" when
+   *  the rows named none: a group, or no rows under the id we send to. */
+  function noteThreadService(chat, service) {
+    root.threadSendServiceChat = String(chat || "")
+    root.threadSendService = String(service || "")
+  }
+
+  /** The --service a send to `chat` carries, through SendState.sendServiceArg:
+   *  the loaded rows' answer when they belong to `chat`, else the list label. */
+  function sendServiceFor(chat) {
+    return SendState.sendServiceArg(String(chat), root.activeIsGroup,
+      String(root.active.service || ""), root.threadSendServiceChat, root.threadSendService)
+  }
   // Sends the Mac has not written a row for yet, {chat, text, ts}. Every
   // thread reload carries them to thread.ts (--pending-stdin, never argv),
   // which keeps their bubbles until the real row lands. Memory only.
@@ -754,7 +773,7 @@ FocusScope {
     pendingThreadChat = ""
     root.threadPendingRevision = root.pendingRevision
     root.threadTapbackDone = !!(root.pendingTapback && root.pendingTapback.done)
-    var pending = root.pendingSends.filter(function(p) { return p.chat === threadRunningChat })
+    var pending = root.pendingSends.concat(hostWidget ? hostWidget.replyPending : []).filter(function(p) { return p.chat === threadRunningChat })
     threadProc.command = ["bun", root.threadScript, threadRunningChat, "80",
                           "--time-format", root.timeFormat,
                           "--date-format", root.dateFormat,
@@ -1324,7 +1343,7 @@ FocusScope {
     for (var i = 0; i < bubbles.length; i++) {
       var atts = (bubbles[i].attachments || []).concat((bubbles[i].stickers || []).map(function(sticker) { return sticker.attachment }))
       var replied = bubbles[i].replyAttachment
-      if (replied && isImageMime(replied.mime)) enqueueFetch(replied, "", true)
+      if (replied && isImageMime(replied.mime) && typeof replied.bytes === "number" && replied.bytes > 0 && replied.bytes <= root.autoFetchMaxSource) enqueueFetch(replied, "", true)
       for (var j = 0; j < atts.length; j++) {
         // Bytes must be KNOWN — null/0 must not slip through and auto-pull
         // something the click-path 100 MB ceiling would allow. The SOURCE cap
@@ -1822,8 +1841,7 @@ FocusScope {
       // strictly one at a time — pumpFileSend() starts the next as each lands.
       root.fileQueue = root.attachDrafts.map(function(d) { return d.path })
       root.sendCaption = trimmed
-      var svc = String(root.active.service || "")
-      root.sendService = /^(SMS|RCS)$/i.test(svc) ? svc.toUpperCase() : ""
+      root.sendService = root.sendServiceFor(root.sendChat)
       pumpFileSend()
       return
     }
@@ -1836,10 +1854,11 @@ FocusScope {
     var target = root.activeIsGroup
       ? ["--chat-id", String(root.active.guid)]
       : ["--to", chat]
-    // green-bubble (SMS/RCS) threads send on their own service (war room #2)
-    var svc = String(root.active.service || "")
-    if (!root.activeIsGroup && /^(SMS|RCS)$/i.test(svc)) target = target.concat(["--service", svc.toUpperCase()])
-    var localId = String(++root.nextSendId)
+    // green-bubble (SMS/RCS) threads send on their own service (war room #2),
+    // read from the conversation's own rows once they have loaded
+    var svc = root.sendServiceFor(chat)
+    if (svc !== "") target = target.concat(["--service", svc])
+    var localId = String(Date.now()) + "-" + String(++root.nextSendId)
     root.pendingRevision++
     var reply = root.replyTarget
     root.replyTarget = null
@@ -1849,12 +1868,16 @@ FocusScope {
       pendingSend.replyMine = reply.mine
       pendingSend.replyAttachment = reply.attachment
     }
-    root.pendingSends = root.pendingSends.concat([pendingSend])
+    if (!reply) root.pendingSends = root.pendingSends.concat([pendingSend])
     root.bubbles = root.appendPendingBubble(root.bubbles, text, stamp, localId, reply)
     root.pinToBottom = true
     composeField.text = ""
     note = ""
-    root.sendQueue = root.sendQueue.concat([{ chat: chat, text: text, stamp: stamp, localId: localId, target: target, reply: reply }])
+    if (reply) {
+      hostWidget.queueReply({ chat: chat, text: text, stamp: stamp, localId: localId, reply: reply }, pendingSend)
+      return
+    }
+    root.sendQueue = root.sendQueue.concat([{ chat: chat, text: text, stamp: stamp, localId: localId, target: target, reply: null }])
     pumpSend()
   }
 
@@ -1904,13 +1927,13 @@ FocusScope {
     return out
   }
 
-  function failPending(chat, localId, reason, text, stamp) {
+  function failPending(chat, localId, reason, text, stamp, reply) {
     root.pendingRevision++
     root.pendingSends = SendState.markSendFailed(root.pendingSends, localId, reason,
-      {chat: chat, localId: localId, text: text, ts: stamp})
+      {chat: chat, localId: localId, text: text, ts: stamp, replyText: reply ? reply.text : "", replyMine: reply ? reply.mine : false, replyAttachment: reply ? reply.attachment : null})
     if (root.inThread && String(root.active.chat) === chat) {
       if (!root.bubbles.some(function(b) { return b.localId === localId }))
-        root.bubbles = root.appendPendingBubble(root.bubbles, text, stamp, localId)
+        root.bubbles = root.appendPendingBubble(root.bubbles, text, stamp, localId, reply)
       root.bubbles = SendState.markSendFailed(root.bubbles, localId, reason)
     }
   }
@@ -1924,7 +1947,6 @@ FocusScope {
     root.sendText = job.text
     root.sendStamp = job.stamp
     root.sendLocalId = job.localId
-    root.sendReply = job.reply || null
     sendProc.lastErr = ""
     root.reloadTries = 0
     // Body on STDIN (--text-stdin), never argv: argv is readable by every
@@ -1932,9 +1954,7 @@ FocusScope {
     // Which program sends is source-id.ts's answer for this conversation — in
     // stock Blip always the Mac's imsg-send in bin_dir, exactly as before.
     var binDir = hostWidget ? hostWidget.binDir : root.home + "/bin"
-    sendProc.command = job.reply
-      ? SourceId.bridgeArgv(job.chat, "imsg-reply", binDir).concat(["--guid", job.reply.guid, "--yes", "--text-stdin"])
-      : SourceId.bridgeArgv(job.chat, "imsg-send", binDir).concat(job.target).concat(["--yes", "--text-stdin", "--keep-dashes"])
+    sendProc.command = SourceId.bridgeArgv(job.chat, "imsg-send", binDir).concat(job.target).concat(["--yes", "--text-stdin", "--keep-dashes"])
     sendProc.stdinEnabled = true
     sendProc.running = true
     sendProc.write(job.text)
@@ -2037,6 +2057,7 @@ FocusScope {
           var d = JSON.parse(text.trim())
           if (d.ok === true) {
             var list = Array.isArray(d.bubbles) ? d.bubbles : []
+            root.noteThreadService(root.threadRunningChat, d.service)
             root.pendingTapback = TapbackActions.pendingAfterLoad(root.pendingTapback, root.threadRunningChat, list, root.threadTapbackDone)
             // the tool is done but chat.db does not show it yet (a self-thread's echo lags): look again
             if (root.threadTapbackDone && root.pendingTapback && root.pendingTapback.chat === root.threadRunningChat) {
@@ -2056,7 +2077,8 @@ FocusScope {
             // ordinary reload (the bubble stays up either way).
             if (Array.isArray(d.pending)) {
               var chat = root.threadRunningChat
-              root.pendingSends = root.pendingSends.filter(function(p) { return p.chat !== chat }).concat(d.pending)
+              root.pendingSends = root.pendingSends.filter(function(p) { return p.chat !== chat }).concat(d.pending.filter(function(p) { return !p.replyText }))
+              if (hostWidget) hostWidget.reconcileReplies(chat, d.pending)
               if (d.pending.some(function(p) { return p.failed !== true }) && root.reloadTries < 8) {
                 root.reloadTries++
                 root.reloadChat = chat
@@ -2122,9 +2144,7 @@ FocusScope {
       var completedText = root.sendText
       var completedStamp = root.sendStamp
       var completedId = root.sendLocalId
-      var completedReply = root.sendReply
       var belongsHere = root.inThread && String(root.active.chat) === completedChat
-      root.sendReply = null
       root.sendChat = ""
       root.sendText = ""
       root.sendStamp = ""
@@ -2133,12 +2153,6 @@ FocusScope {
         // The bubble is already up; reload to swap it for the real row.
         root.reloadChat = completedChat
         reloadTimer.restart()
-      } else if (completedReply && code === 76) {
-        // Return was pressed but chat.db did not confirm it. Handing the words
-        // back would invite sending the reply twice.
-        root.reloadChat = completedChat
-        reloadTimer.restart()
-        if (belongsHere) root.note = sendProc.lastErr.replace(/^imsg-reply:\s*/, "")
       } else {
         // Keep the failed bubble; put the words back in the field (unless a
         // newer draft is there), and the reason is on the status line.
@@ -2147,9 +2161,8 @@ FocusScope {
           : plainErr !== "" ? plainErr : "Send failed (exit " + code + ")"
         root.failPending(completedChat, completedId, reason, completedText, completedStamp)
         if (belongsHere) {
-          if (composeField.text === "") {
+          if (composeField.text === "" && belongsHere) {
             composeField.text = completedText
-            if (completedReply) root.replyTarget = completedReply
           }
           if (code === 69 || code === 255) root.note = "not sent — Mac unreachable"
           else root.note = (plainErr !== "" ? "send failed: " + plainErr : "send failed (exit " + code + ")")
@@ -2163,6 +2176,17 @@ FocusScope {
   // imsg-react runs in hostWidget (BarWidget), which outlives this view.
   Connections {
     target: root.hostWidget
+    function onReplyPendingChanged() { root.pendingRevision++ }
+    function onReplyExited(job, code, reason) {
+      if (root.inThread && String(root.active.chat) === job.chat) {
+        root.note = reason
+        if (SendState.replyCanRestore(code) && composeField.text === "") {
+          composeField.text = job.text
+          root.replyTarget = job.reply
+        }
+        root.requestThreadLoad(job.chat)
+      }
+    }
     function onTapbackExited(chat, ok) {
       if (ok) {
         // the thread was left while it ran: nothing on screen is waiting for it
@@ -4302,7 +4326,7 @@ FocusScope {
                     Layout.leftMargin: bubbleRow.mine ? 0 : Style.space(6)
                     Layout.maximumWidth: Math.max(1, content.width * 0.78)
                     wrapMode: Text.WrapAnywhere
-                    text: [modelData.failed === true ? "⚠ Not Delivered" : "",
+                    text: [modelData.failed === true ? (modelData.failureReason === "Check Messages before sending again" ? "⚠ Delivery unconfirmed" : "⚠ Not Delivered") : "",
                            modelData.failed === true ? String(modelData.failureReason || "")
                              : modelData.scheduled === true ? "Scheduled for " + String(modelData.scheduledFor || "")
                              : "",

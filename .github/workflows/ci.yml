@@ -36,6 +36,8 @@ jobs:
           pactl load-module module-null-sink sink_name=blip_test >/dev/null
           pactl set-default-sink blip_test
           python3 scripts/test-read-ui.py
+          python3 scripts/test-send-service-ui.py
+          python3 scripts/test-reply-ui.py
           python3 scripts/test-reaction-ui.py
           python3 scripts/test-reaction-badge-ui.py
           python3 scripts/test-background-ui.py
@@ -86,7 +88,10 @@ jobs:
           python3 bridge/mac/test_react.py
           python3 bridge/mac/test_reaction_kind.py
       - name: native replies (synthetic)
-        run: python3 bridge/mac/test_reply.py
+        run: |
+          python3 bridge/mac/test_reply.py
+          python3 bridge/mac/test_reply_enrich.py
+          python3 bridge/mac/test_reply_jxa.py
       - name: hide Spam / unknown senders (no macOS needed)
         run: python3 bridge/mac/test_filtered.py
       - name: contact review across sources (no macOS needed)

@@ -527,7 +527,8 @@ prefer_imessage=on
 
 A thread with a successful iMessage in the loaded window then stays
 iMessage. A never-iMessage RCS/SMS thread stays green. A failed iMessage to
-a phone still flips to SMS so the send does not stick. Groups are unchanged
+a phone still flips the next send to RCS, if that is how they last texted
+you, or to SMS, so the send does not stick. Groups are unchanged
 (they send by chat id). Default is off.
 
 **Tapbacks (experimental).** Right-click a message, or select it
@@ -906,6 +907,14 @@ A complete metadata-only `imsg read-state` snapshot reconciles blue dots even
 for conversations outside the recent-message window. Confirmed local overrides
 are retired, allowing later Mac/iPhone changes to take effect. Both updated
 Mac tools require the sibling `read_state.py` module.
+
+Mark-all is attempted once. If it fails or is interrupted, its click timestamp
+is retained and the next complete read-state snapshot turns it into bounded
+per-conversation retries. Messages newer than the click remain unread. Service
+conversations whose identifiers cannot be opened individually keep a local
+read marker; they require a later successful mark-all in Messages to sync.
+A locked Mac refuses UI read actions promptly; unlocking is still required
+for those actions to reach Messages.
 
 `push_read` in `bridge.conf` takes three values, and the default surprises
 people: **`all`** (the default) pushes *only* on the mark-all gesture, so

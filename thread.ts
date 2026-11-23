@@ -23,9 +23,13 @@ import {
   loadState,
   mergeTapbacks,
   normalizeMsgStamps,
+  preferImessagePolicy,
+  sendFailed,
+  sendServiceForMessages,
   type AttachmentMeta,
   type ImsgMessage,
   type LinkCard,
+  type SendService,
   type Tapback,
 } from "./collector";
 export { dedupeSelfEcho };
@@ -130,6 +134,7 @@ export interface PendingSend {
   localId?: string;
   failed?: boolean;
   failureReason?: string;
+  inFlight?: boolean;
   replyText?: string;
   replyMine?: boolean;
   replyAttachment?: AttachmentMeta | null;
@@ -142,6 +147,12 @@ export interface ThreadOutput {
   bubbles: Bubble[];
   /** Sends for this chat the Mac has not written yet (`--pending-stdin`). */
   pending?: PendingSend[];
+  /** What a DM sends on, decided from the rows of the id it sends to
+   *  (`threadSendService`). The list row's service is the Mac's chat label
+   *  and goes stale when a contact moves to Android, so BlipView prefers this
+   *  once it has loaded. Absent for groups, which send by chat id, and for a
+   *  DM with no rows under its own id, where the label has to stand. */
+  service?: SendService;
 }
 
 // ---------------------------------------------------------------- formatting
@@ -333,6 +344,8 @@ export function decorate(msgs: ImsgMessage[], today: string, formats = DEFAULT_F
       !sameSender(m, next) ||
       minutesBetween(m.ts, next.ts) > GROUP_GAP_MINUTES;
     const stickerState = normalizeStickerOverlays(m.stickers);
+    // A read receipt outranks the Mac's error code (`sendFailed`).
+    const failed = sendFailed(m);
 
     out.push({
       ts: m.ts,
@@ -362,7 +375,7 @@ export function decorate(msgs: ImsgMessage[], today: string, formats = DEFAULT_F
       effect: m.effect ?? "",
       audio: m.audio === true,
       html: linkify((m.text ?? "").replace(/￼/g, "").trim()),
-      failed: m.from_me && typeof m.error === "number" && m.error !== 0,
+      failed,
       ...(m.scheduled === true
         ? { scheduled: true, scheduledFor: `${dayLabel(m.ts, today, formats)} ${clockLabel(m.ts, formats.time)}` }
         : {}),
@@ -478,7 +491,7 @@ export function pendingBubble(prev: Bubble | undefined, send: PendingSend, today
  */
 export function withPendingSends(bubbles: Bubble[], pending: PendingSend[], today: string, formats = DEFAULT_FORMATS, now = Date.now()): { bubbles: Bubble[]; pending: PendingSend[] } {
   const live = pending
-    .filter((p) => Number.isFinite(stampMs(p.ts)) && (p.failed === true || now - stampMs(p.ts) <= PENDING_MAX_AGE_MS))
+    .filter((p) => Number.isFinite(stampMs(p.ts)) && (p.failed === true || p.inFlight === true || now - stampMs(p.ts) <= PENDING_MAX_AGE_MS))
     .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   if (live.length === 0) return { bubbles, pending: [] };
   const taken = new Set<number>();
@@ -560,7 +573,7 @@ export function readReceipt(readAt: string, today: string, formats = DEFAULT_FOR
 }
 
 function receiptFor(m: ImsgMessage | null, last: boolean, today: string, formats: typeof DEFAULT_FORMATS): Pick<Bubble, "receipt" | "receiptDetail" | "receiptSlot"> {
-  if (!m || (m.error ?? 0) !== 0) return { receipt: "", receiptDetail: "", receiptSlot: false };
+  if (!m || sendFailed(m)) return { receipt: "", receiptDetail: "", receiptSlot: false };
   if (m.read_at) return { ...readReceipt(m.read_at, today, formats), receiptSlot: last };
   return { receipt: m.delivered ? "Delivered" : "", receiptDetail: "", receiptSlot: last };
 }
@@ -631,6 +644,19 @@ export function selectThread(
   return msgs.length > limit ? msgs.slice(msgs.length - limit) : msgs;
 }
 
+/**
+ * What a DM in this conversation sends on, from the rows of the id it sends
+ * `--to` and no others. A merged phone + email conversation shows both
+ * handles' rows. Deciding from all of them sent SMS to an email address, and
+ * iMessage to an Android number after they last wrote from the email (#165
+ * review). No rows of its own → undefined. An empty answer must not stand in
+ * as "iMessage": the caller keeps the list's label instead.
+ */
+export function threadSendService(msgs: ImsgMessage[], chat: string, preferImessage = false): SendService | undefined {
+  const own = msgs.filter((m) => chatKey(m) === chat);
+  return own.length ? sendServiceForMessages(own, preferImessage, chat) : undefined;
+}
+
 // ---------------------------------------------------------------- transport
 
 export function loadThread(
@@ -639,6 +665,7 @@ export function loadThread(
   today: string,
   formats = DEFAULT_FORMATS,
   runner = spawnSync,
+  preferImessage?: boolean,
 ): ThreadOutput {
   // Groups load by EXACT chat id (imsg ≥1.8.0 `thread --chat`). The old
   // recent-window scan cost ~20× the rows and missed anything older than
@@ -667,7 +694,11 @@ export function loadThread(
     const msgs = selectThread(
       rows, chat, group, limit, state.selfChats, state.chatAliases,
     );
-    return { ok: true, online: true, error: "", bubbles: decorate(msgs, today, formats) };
+    const service = group ? undefined : threadSendService(msgs, chat, preferImessage ?? preferImessagePolicy());
+    return {
+      ok: true, online: true, error: "", bubbles: decorate(msgs, today, formats),
+      ...(service ? { service } : {}),
+    };
   } catch (e) {
     return { ok: false, online: true, error: `bad JSON from imsg: ${e}`, bubbles: [] };
   }

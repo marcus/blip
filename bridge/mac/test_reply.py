@@ -85,6 +85,15 @@ class Targets(unittest.TestCase):
             self.refused(db, guid, "unsupported")
         self.refused(db, "nope", "no-such-message")
 
+    def test_other_attachment_types_never_shift_picture_ordinal(self):
+        for files in ([('video/mp4','v.mp4',0)], [('image/png','s.png',1)], [PNG,PNG]):
+            db=Db(); db.msg("P",files=[PNG]); db.msg("OTHER",files=files,date=BASE+1)
+            self.assertEqual(tool.resolve(db.con,imsg,"P",[])["ordinal"],0)
+
+    def test_group_picture_is_refused(self):
+        db=Db(); db.msg("P",files=[PNG],chat=2)
+        self.refused(db,"P","unsupported")
+
     def test_two_pictures_in_a_minute_are_refused_not_guessed(self):
         db = Db()
         db.msg("P1", "", files=[PNG], date=BASE)
@@ -98,11 +107,23 @@ class Targets(unittest.TestCase):
         db.msg("P2", "", files=[PNG], date=BASE + 10**9, me=0)
         self.assertTrue(tool.resolve(db.con, imsg, "P1", [])["picture"])
 
-    def test_the_same_minute_on_a_later_day_is_counted_from_the_bottom(self):
+    def test_the_same_minute_on_a_later_day_is_refused(self):
         db = Db()
         db.msg("P1", "", files=[PNG], date=BASE)
         db.msg("P2", "", files=[PNG], date=BASE + 86400 * 2 * 10**9)
-        self.assertEqual(tool.resolve(db.con, imsg, "P1", [])["ordinal"], 1)
+        self.refused(db, "P1", "ambiguous")
+
+    def test_identical_text_in_a_minute_or_on_another_day_is_refused(self):
+        for offset in (10**9, 86400 * 2 * 10**9):
+            db = Db()
+            db.msg("T", "ok")
+            db.msg("TWIN", "ok", date=BASE + offset)
+            self.refused(db, "T", "ambiguous")
+
+    def test_picture_with_balloon_is_refused(self):
+        db = Db()
+        db.msg("P", files=[PNG], balloon_bundle_id="x.app")
+        self.refused(db, "P", "unsupported")
 
     def test_a_self_thread_picture_aims_at_the_sent_row_and_knows_its_echo(self):
         db = Db()
@@ -169,6 +190,12 @@ class Run(unittest.TestCase):
     def land(self, db, orig, text="the reply", chat=1, error=0):
         return lambda: db.msg("R", text, date=BASE + 5 * 10**9, chat=chat, thread_originator_guid=orig, error=error)
 
+    def test_prefix_neighbour_does_not_crash_shared_reaction_resolution(self):
+        db = Db()
+        db.msg("T", "ok")
+        db.msg("N", "ok, see you then", date=BASE+1)
+        self.assertEqual(target_of(db, "T")["text"], "ok")
+
     def test_sent_when_chat_db_names_the_target(self):
         db = Db(); db.msg("T", "hello")
         ui = Ui()
@@ -222,6 +249,25 @@ class Run(unittest.TestCase):
             self.assertEqual((ctx.exception.result["code"], ctx.exception.exit_code), (code, tool.EX_TEMPFAIL))
             self.assertEqual(s.calls[-1], "close")
 
+    def test_slow_field_clear_confirms_instead_of_inviting_resend(self):
+        db = Db(); db.msg("T", "hello")
+        for error in ("not-sent", "unconfirmed"):
+            s = Script(send={"ok":False,"error":error}, land=self.land(db,"T"))
+            self.assertEqual(self.go(db,s)["result"], "sent")
+
+    def test_confirmation_errors_are_always_uncertain(self):
+        for error in (sqlite3.OperationalError("unavailable"), OSError("unavailable")):
+            db = Db(); db.msg("T", "hello")
+            with patch.object(tool, "find_reply", side_effect=error):
+                with self.assertRaises(rx.Stop) as ctx: self.go(db, Script())
+            self.assertEqual(ctx.exception.exit_code, 76)
+
+    def test_old_or_incoming_rows_cannot_confirm(self):
+        for me, date in ((0, BASE+1), (1, BASE-1)):
+            db = Db(); db.msg("T", "hello")
+            db.msg("R", "the reply", me=me,date=date,thread_originator_guid="T")
+            self.assertIsNone(tool.find_reply(db.con,imsg,{"T"},"the reply",BASE))
+
     def test_no_row_after_return_is_unconfirmed_and_never_says_resend(self):
         db = Db(); db.msg("T", "hello")
         s = Script()
@@ -235,6 +281,24 @@ class Run(unittest.TestCase):
         s = Script(send={"ok": False, "error": "timeout"}, land=self.land(db, "T"))
         self.assertEqual(self.go(db, s)["result"], "sent")
         self.assertEqual(s.calls.count("send"), 1)
+
+    def test_send_script_exception_never_claims_nothing_sent(self):
+        db = Db(); db.msg("T", "hello")
+        script = Script()
+        original = script.run
+        def run(q):
+            if q["mode"] == "send":
+                raise RuntimeError("lost script")
+            return original(q)
+        script.run = run
+        with patch.object(tool, "CONFIRM_SECONDS", 0.5), self.assertRaises(rx.Stop) as ctx:
+            self.go(db, script)
+        self.assertEqual(ctx.exception.exit_code, tool.EX_UNCONFIRMED)
+
+    def test_wrong_text_in_correct_thread_cannot_confirm(self):
+        db = Db(); db.msg("T", "hello")
+        db.msg("R", "other words", date=BASE+1, thread_originator_guid="T")
+        self.assertIsNone(tool.find_reply(db.con, imsg, {"T"}, "the reply", BASE))
 
     def test_a_row_with_the_wrong_thread_or_text_does_not_confirm(self):
         db = Db(); db.msg("T", "hello"); db.msg("OTHER", "other", date=BASE + MINUTE)
@@ -278,6 +342,20 @@ class Text(unittest.TestCase):
         self.assertIn("sent exit=0 1.2s", log)
         self.assertIn("draft exit=75", log)
         self.assertNotIn("a draft", log)
+
+    def test_dry_run_never_touches_the_ui(self):
+        db=Db(); db.msg("T","hello")
+        fake_imsg=types.SimpleNamespace(DB_PATH="synthetic",message_text=imsg.message_text,chat_cluster_ids=imsg.chat_cluster_ids)
+        def sibling(name):
+            if name == "imsg": return fake_imsg
+            if name == "imsg-send": return types.SimpleNamespace(detect_self_handles=lambda: [])
+            raise AssertionError("dry run touched UI")
+        with patch.object(rx,"sibling",side_effect=sibling), patch.object(tool.sqlite3,"connect",return_value=db.con), patch.object(tool.sys,"stdin",types.SimpleNamespace(buffer=io.BytesIO(b"synthetic reply"))), patch.object(tool,"emit",side_effect=lambda r: 0 if not isinstance(r,rx.Stop) else r.exit_code):
+            self.assertEqual(tool.main(["--guid","T","--text-stdin"]),0)
+
+    def test_invalid_guid_is_refused_before_any_lookup(self):
+        with patch.object(rx,"sibling",side_effect=AssertionError("must not load bridge")), patch.object(tool,"emit",side_effect=lambda r:r.exit_code):
+            self.assertEqual(tool.main(["--guid","bad;guid","--text-stdin"]),tool.EX_USAGE)
 
     def test_no_guid_no_tool(self):
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):

@@ -118,6 +118,25 @@ what it is handed. Keep it that way.
   bubble until a real from-me row with the same text lands, resolving one
   send per row. The read watermark (`--seen`) skips pending bubbles: their ts
   is THIS machine's clock. A failed send retains its bubble with a failure reason in memory. Never go back to "wait 1.5 s, then reload".
+- **A DM sends on what its own messages say, never on the Mac's chat label.** `imsg chats` reports the
+  chat row's `service_name`. On a gateway where one row holds the whole conversation (observed on macOS
+  27.2), that label follows the Mac's OWN last send, Blip's included, so trusting it loops. On 2026-11-12, a
+  contact texting on RCS stayed labelled iMessage and every send failed with error 22. Another stayed
+  labelled SMS and got plain SMS. `sendServiceForMessages` decides from rows in two places. In the
+  collector it reads the preview window: `mergeChats` keeps that answer for every DM with rows under its
+  own id, and the label names only the rest. In `thread.ts` it reads the opened conversation
+  (`threadSendService`) and reports it as `service`, which BlipView prefers through
+  `SendState.sendServiceArg`. #97, #147 and #151 each guarded one direction of this same loop.
+  **Only rows under the id the send goes `--to` count** (`target`; `foldThreadAliases` keeps the
+  canonical's own service). A merged phone + email conversation carries both handles' rows. Deciding from
+  all of them sent SMS to the email, and iMessage to an Android number after they last wrote from the
+  email (#165 review). No own rows means no answer, and the label stands. An address that is not a phone
+  number never gets SMS. It gets RCS only after texting us on RCS, as `name@rbm.goog` business agents do.
+  Our iMessage that provably arrived (delivered or read) after their last text keeps a quiet blue DM
+  blue. A read receipt outranks `error` (`sendFailed`) only for SMS and RCS in a 1:1, because the Mac
+  logs error 4 on plain SMS it relays to an RCS contact and the iPhone delivers it anyway. Thread loads
+  are `--rich` and carry the receipt. The collector's `recent` rows are not, so its failure toast still
+  fires for that SMS.
 - **A Mac that is signed out READS fine and cannot SEND.** Reads are sqlite over ssh and need no login; a send
   needs Messages, and Launch Services starts an app only inside a GUI session, so at the login window every send
   dies with -10810 (`friendlySendError` says it in plain words). `imsg session` is the read-only probe
@@ -211,9 +230,14 @@ what it is handed. Keep it that way.
   retry counters/deadlines and bounded bridge status errors. Persist BEFORE any
   Mac mutation, then execute one due action per collector run. Never detach it.
   A failed action survives restarts and retries with backoff (2–60 seconds).
-  Only `--all` is dropped on failure (it cannot be bounded); a per-chat intent
-  is NEVER dropped, however many attempts. Dropping one after five tries
-  resurrected a dot the user had already read through `intent.seen`, after a
+  `--all` is attempted once; a failure or interruption keeps its click timestamp
+  and becomes per-chat `--through` retries from the next complete snapshot.
+  Later arrivals and explicit gestures are preserved; without a snapshot the
+  bulk intent waits without repeating `--all`. Business/service ids that cannot
+  be opened individually retain the bounded bulk marker until a snapshot
+  confirms they are read; the marker never blocks later per-chat gestures.
+  Attempts are persisted before touching Messages. A per-chat intent is NEVER
+  dropped, however many attempts. Dropping one after five tries resurrected a dot the user had already read through `intent.seen`, after a
   night of a locked Mac (441 attempts, 2026-10-06). A kept intent cannot
   consume a newer inbound: the snapshot compare and `--through` guard it.
   `imsg read-state` returns the COMPLETE metadata-only unread snapshot; it is

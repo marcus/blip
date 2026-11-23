@@ -29,7 +29,7 @@ restores whichever app was there.
 2. A draft in the composer stops the run, before anything is pressed.
 3. The bubble search in `imsg-react` presses `Reply…` once.
 4. The reply view must name the target. The field is filled through AX and read back.
-5. Focus is rechecked, then Return is pressed.
+5. Recipient, target, front app, reply-field identity and its exact text are rechecked, then Return is pressed.
 6. `chat.db` must show your row with this text naming the target's thread.
 7. The reply view is closed and the previous app comes back.
 
@@ -38,7 +38,10 @@ restores whichever app was there.
 | 0 | Sent and confirmed | Reloads to the real row |
 | 75 | Nothing was sent, including a locked Mac or a draft | Failed bubble, words and target back in the composer |
 | 76 | Return was pressed but not confirmed, or Messages reported an error | Says so; **never hands the words back**, because a resend could duplicate |
-| 65, 69, 77 | Refused, unavailable, or no permission | Same as 75 |
+| 65, 77 | Refused or no permission | Same as 75 |
+| 78 or helper never started | Refused locally before ssh | Words and target back in the composer |
+| Crash/signal exit | Return may have reached the Mac | Check Messages; no automatic handback |
+| 69, 70, 255 | Lost transport or unexpected error | Check Messages; no automatic handback |
 
 Never retry after Return. The log, `~/.blip/reply.log`, holds the outcome code, exit
 status and duration, never a GUID or text.
@@ -91,21 +94,6 @@ never reaches Linux disk or argv.
   under the email chat. Confirm by thread and text, never by chat. Filtering by chat
   made working replies look lost during the investigation.
 
-## Known limits
-
-- **The Mac must be unlocked.** A locked Mac fails with a clear message and nothing is
-  sent. Native tapbacks have the same limit.
-- **A reply can appear in another of the person's conversations.** When someone has two
-  addresses that Blip hasn't merged, the reply may land under the other one. Messages
-  draws them as one thread; Blip shows the reply under the other chat, and the pending
-  bubble here expires after two minutes. It was seen in a self-thread, where the email
-  and phone chats aren't merged. Addresses merged through `chatAliases` are read
-  together, so they shouldn't show this, but no merged conversation has been tested.
-- **In a self-thread, a picture shows twice in Blip**: the sent row and its echo. Replying
-  to either works. Blip's echo folding doesn't cover this case.
-- **The whole path has only been exercised in a self-thread.** Real one-to-one
-  conversations use the same route, but no reply has been sent in one during testing.
-
 ## Dead ends
 
 - **AppleScript has no reply.** `send` takes no reply target.
@@ -126,12 +114,6 @@ never reaches Linux disk or argv.
   loose label filter prints other people's conversation previews. Filter on bubbles
   offering `Reply…`, and keep to the self-thread.
 - Never run `entireContents` while the emoji catalogue is open. See `reactions.md`.
-- Any query that looks for test rows must filter on your marker text. A filter on
-  `ROWID` alone also returns other conversations' messages that arrived in between.
-- A self-thread can span several chats, so check that a surprising chat is really yours
-  before assuming: its participants must all be in `detect_self_handles()`.
-- `grim -g` captures the screen, not the window. A Blip window on another workspace gets
-  whatever is on top at those coordinates.
 - `imsg-send` takes attachments with `--file-stdin --file-bytes N --name X`.
 
 ## Not built, and what it would take
@@ -159,8 +141,14 @@ only reads `chat.db`.
 ## Testing
 
 `bridge/mac/test_reply.py` runs on a synthetic `chat.db` with a scripted Messages.
-`message-actions.test.ts`, `thread.test.ts` and `tapbacks.test.ts` cover the Linux side.
+`message-actions.test.ts`, `thread.test.ts` and `tapbacks.test.ts` cover the Linux side. `reply-ax.test.ts` executes the shipped JXA against a synthetic AX tree and checks that draft, recipient and target refusals happen before any field write. `reply-session.test.ts` executes the QML completion handler, including preserving a newer draft and ignoring another conversation. Removing any of those four guards fails the tests.
 For a live run, target only your own self-thread:
 
     printf 'test' | ~/.blip/bin/imsg-reply --guid GUID --text-stdin        # dry run
     printf 'test' | ~/.blip/bin/imsg-reply --guid GUID --text-stdin --yes
+
+This split uses the native AX helpers and bounded stale-picker preflight already on main from the reactions feature. Its only changes to `imsg-react` add picture-bubble discovery and carry that flag into the native action request.
+
+Recipient verification fails closed: immediately before Return the Messages window must have no sheet and its title must exactly match the target address or contact name, in addition to the target label and time in the reply transcript. This title shape needs gateway validation; unsupported titles refuse the send. Return followed by slow field clearing, a confirm database error, or lost ssh is unconfirmed: check Messages before sending again. Reply jobs and their result bubbles are owned by BarWidget and survive view closure.
+
+Identical text or picture labels with a later twin at the same HH:MM are refused before opening Messages, even across different days. Reply targeting does not rely on an ordinal count to distinguish these twins.

@@ -128,16 +128,12 @@ describe("QML safety invariants", () => {
     expect(panel).toContain("var completedStamp = root.sendStamp");
     // the field clears as Enter is pressed; a failure puts the words back
     // only when nothing newer has been typed
-    expect(panel).toContain("if (composeField.text === \"\") {\n            composeField.text = completedText");
+    expect(panel).toContain("if (composeField.text === \"\" && belongsHere) {");
   });
 
   test("a send shows its bubble at once and reloads carry the in-flight ledger on stdin", () => {
-    expect(panel).toContain("root.bubbles = root.appendPendingBubble(root.bubbles, text, stamp, localId)");
-    expect(panel).toContain("var pendingSend = { chat: chat, text: text, ts: stamp, localId: localId }");
+    expect(panel).toContain("root.bubbles = root.appendPendingBubble(root.bubbles, text, stamp, localId, reply)");
     expect(panel).toContain("root.pendingSends = root.pendingSends.concat([pendingSend])");
-    // a reply whose Return went through but is unconfirmed never hands its words back
-    expect(panel).toContain("} else if (completedReply && code === 76) {");
-    expect(panel).toContain('SourceId.bridgeArgv(job.chat, "imsg-reply", binDir).concat(["--guid", job.reply.guid, "--yes", "--text-stdin"])');
     expect(panel).toContain('"--pending-stdin"');
     expect(panel).toContain("threadProc.write(JSON.stringify(pending))");
     expect(panel).toContain("root.failPending(completedChat, completedId, reason, completedText, completedStamp)");
@@ -1171,6 +1167,27 @@ describe("a message can carry several files (multi-file drafts)", () => {
     const clear = source("clearAttachments", "/** Ship the next queued file");
     expect(clear).toContain("root.attachDrafts = []");
     expect(clear).toContain("root.fileQueue = []");
+  });
+});
+
+describe("a DM sends on its own rows, not the Mac's chat label", () => {
+  // 2026-11-12: root.active.service is the list row's service, the Mac's label
+  // for the chat. It stayed "iMessage" for a contact texting on RCS.
+  // What these functions DO is run for real by scripts/test-send-service-ui.py
+  // (QtTest, the shipping functions, the real SendState.mjs). These checks pin
+  // only that the loader and send() go through them.
+  test("the loader hands thread.ts's service to noteThreadService with the chat it loaded", () => {
+    const load = panel.slice(panel.indexOf("id: threadProc"), panel.indexOf("onExited", panel.indexOf("id: threadProc")));
+    expect(load).toContain("root.noteThreadService(root.threadRunningChat, d.service)");
+    // before the unchanged-snapshot early return, which skips the rest
+    expect(load.indexOf("root.noteThreadService(")).toBeLessThan(load.indexOf("if (j === root.bubblesJson)"));
+  });
+
+  test("text and file sends both ask sendServiceFor, never the label directly", () => {
+    const send = panel.slice(panel.indexOf("function send()"), panel.indexOf("function wireStamp"));
+    expect(send.match(/root\.sendServiceFor\(/g)?.length).toBe(2);
+    expect(send).not.toContain("root.active.service");
+    expect(send).not.toMatch(/test\(svc\)/);
   });
 });
 
